@@ -308,6 +308,11 @@ const WorkerConfiguration = struct {
 
 var g_scratch_buffer: [8192 * 8192]u8 = undefined;
 
+const GraphicsSystemError = error{
+    NoSuitableDeviceFound,
+    VulkanApiError,
+};
+
 const PhysicalDeviceData = struct {
     device: gfx.VkPhysicalDevice,
     props: gfx.VkPhysicalDeviceProperties2,
@@ -399,31 +404,35 @@ fn vk_dbg_utils_msg_callback(
     return gfx.VK_FALSE;
 }
 
-fn get_physical_device(vkinst: gfx.VkInstance, surface: gfx.VkSurfaceKHR, allocator: std.mem.Allocator) ?gfx.VkPhysicalDevice {
+const PhysicalDeviceWithSurfaceData = struct {
+    pdd: PhysicalDeviceData,
+    surface: gfx.VkSurfaceKHR,
+    surface_format: gfx.VkSurfaceFormatKHR,
+    surface_caps: gfx.VkSurfaceCapabilitiesKHR,
+    present_mode: gfx.VkPresentModeKHR,
+    queue_family: u32,
+};
+
+fn get_physical_device(vkinst: gfx.VkInstance, surface: gfx.VkSurfaceKHR, allocator: std.mem.Allocator) !PhysicalDeviceWithSurfaceData {
     const phys_devices = enum_physical_devices: {
         var count: u32 = 0;
-        _ = gfx.vkEnumeratePhysicalDevices(vkinst, &count, null);
-        if (count == 0) {
-            return null;
+        var query_result = gfx.vkEnumeratePhysicalDevices(vkinst, &count, null);
+        if (query_result != gfx.VK_SUCCESS or count == 0) {
+            return error.VulkanApiError;
         }
 
-        var phys_devices = std.ArrayList(gfx.VkPhysicalDevice).initCapacity(allocator, count) catch {
-            return null;
-        };
-        phys_devices.resize(count) catch {
-            return null;
-        };
+        var phys_devices = try std.ArrayList(gfx.VkPhysicalDevice).initCapacity(allocator, count);
+        try phys_devices.resize(count);
 
-        _ = gfx.vkEnumeratePhysicalDevices(vkinst, &count, phys_devices.items.ptr);
+        query_result = gfx.vkEnumeratePhysicalDevices(vkinst, &count, phys_devices.items.ptr);
+        if (query_result != gfx.VK_SUCCESS or count == 0) {
+            return error.VulkanApiError;
+        }
         break :enum_physical_devices phys_devices;
     };
     defer {
         phys_devices.deinit();
     }
-
-    // var phys_dev_props = std.ArrayList(PhysicalDeviceData).initCapacity(allocator, phys_devices.items.len) catch {
-    //     return null;
-    // };
 
     const pdd = find_best_physical_device: for (phys_devices.items) |pd| {
         const pdd = PhysicalDeviceData.create(pd);
@@ -455,13 +464,15 @@ fn get_physical_device(vkinst: gfx.VkInstance, surface: gfx.VkSurfaceKHR, alloca
         const queue_families = get_queue_families: {
             var queues: u32 = 0;
             gfx.vkGetPhysicalDeviceQueueFamilyProperties(pdd.device, &queues, null);
-            var queue_props = std.ArrayList(gfx.VkQueueFamilyProperties).initCapacity(allocator, queues) catch {
-                return null;
-            };
-            queue_props.resize(queues) catch {
-                return null;
-            };
+            if (queues == 0)
+                return error.VulkanApiError;
+
+            var queue_props = try std.ArrayList(gfx.VkQueueFamilyProperties).initCapacity(allocator, queues);
+            try queue_props.resize(queues);
             gfx.vkGetPhysicalDeviceQueueFamilyProperties(pdd.device, &queues, queue_props.items.ptr);
+            if (queues == 0)
+                return error.VulkanApiError;
+
             break :get_queue_families queue_props;
         };
         defer {
@@ -500,12 +511,8 @@ fn get_physical_device(vkinst: gfx.VkInstance, surface: gfx.VkSurfaceKHR, alloca
                 continue;
             }
 
-            var surface_formats = std.ArrayList(gfx.VkSurfaceFormatKHR).initCapacity(allocator, fmt_count) catch {
-                return null;
-            };
-            surface_formats.resize(fmt_count) catch {
-                return null;
-            };
+            var surface_formats = try std.ArrayList(gfx.VkSurfaceFormatKHR).initCapacity(allocator, fmt_count);
+            try surface_formats.resize(fmt_count);
 
             query_result = gfx.vkGetPhysicalDeviceSurfaceFormatsKHR(pdd.device, surface, &fmt_count, surface_formats.items.ptr);
             if (query_result != gfx.VK_SUCCESS or fmt_count == 0) {
@@ -538,34 +545,67 @@ fn get_physical_device(vkinst: gfx.VkInstance, surface: gfx.VkSurfaceKHR, alloca
         };
 
         std.log.info("Picked surface format {}", .{picked_surface_fmt});
-        var surface_caps: gfx.VkSurfaceCapabilitiesKHR = undefined;
-        const query_result = gfx.vkGetPhysicalDeviceSurfaceCapabilitiesKHR(pdd.device, surface, &surface_caps);
-        if (query_result != gfx.VK_SUCCESS) {
-            std.log.err("Failed to query surface capabilities, error 0x{X:0>8}", .{@as(u32, @bitCast(query_result))});
-            continue;
-        }
+        const surface_caps = get_surface_caps: {
+            var surface_caps: gfx.VkSurfaceCapabilitiesKHR = undefined;
+            const query_result = gfx.vkGetPhysicalDeviceSurfaceCapabilitiesKHR(pdd.device, surface, &surface_caps);
+            if (query_result != gfx.VK_SUCCESS) {
+                std.log.err("Failed to query surface capabilities, error 0x{X:0>8}", .{@as(u32, @bitCast(query_result))});
+                continue;
+            }
+            break :get_surface_caps surface_caps;
+        };
 
-        break :find_best_physical_device .{
+        const best_present_mode = pick_best_present_mode: {
+            var count: u32 = 0;
+            var query_result = gfx.vkGetPhysicalDeviceSurfacePresentModesKHR(pdd.device, surface, &count, null);
+            if (query_result != gfx.VK_SUCCESS or count == 0) {
+                std.log.err("Failed to query present modes, error 0x{x:0>8}", .{@as(u32, @bitCast(query_result))});
+                continue;
+            }
+
+            var modes = try std.ArrayList(gfx.VkPresentModeKHR).initCapacity(allocator, count);
+            try modes.resize(count);
+
+            query_result = gfx.vkGetPhysicalDeviceSurfacePresentModesKHR(pdd.device, surface, &count, modes.items.ptr);
+            if (query_result != gfx.VK_SUCCESS or count == 0) {
+                std.log.err("Failed to query present modes, error 0x{x:0>8}", .{@as(u32, @bitCast(query_result))});
+                continue;
+            }
+            const preferred_presentation_modes = [_]u32{
+                gfx.VK_PRESENT_MODE_MAILBOX_KHR,
+                gfx.VK_PRESENT_MODE_IMMEDIATE_KHR,
+                gfx.VK_PRESENT_MODE_FIFO_KHR,
+            };
+
+            for (modes.items) |present_mode| {
+                std.log.info("presentation mode: {}", .{present_mode});
+                for (preferred_presentation_modes) |preferred_mode| {
+                    if (preferred_mode == present_mode) {
+                        break :pick_best_present_mode present_mode;
+                    }
+                }
+            } else {
+                std.log.err("Rejecting device {s}, no required present mode supported.", .{pdd.props.properties.deviceName});
+                continue;
+            }
+        };
+
+        std.log.info("Picked presentration mode: {}", .{best_present_mode});
+        break :find_best_physical_device PhysicalDeviceWithSurfaceData{
             .pdd = pdd,
             .surface = surface,
-            .format = picked_surface_fmt,
-            .caps = surface_caps,
+            .surface_format = picked_surface_fmt,
+            .surface_caps = surface_caps,
+            .present_mode = best_present_mode,
+            .queue_family = queue_id,
         };
     } else {
         std.log.err("No suitable device present!", .{});
-        return null;
+        return error.NoSuitableDeviceFound;
     };
 
-    std.log.info("Picked device {any}", .{pdd});
-    return null;
+    return pdd;
 }
-
-const VulkanWsiCreateInfo = union(enum) {
-    win32: struct {
-        hwnd: std.os.windows.HWND,
-        hinstance: std.os.windows.HINSTANCE,
-    },
-};
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -576,236 +616,6 @@ pub fn main() !void {
 
     var fba_alloc = std.heap.FixedBufferAllocator.init(&g_scratch_buffer);
     const fba = fba_alloc.allocator();
-    //
-    //
-    // const IMAGE_WIDTH: u32 = 1024;
-    // const IMAGE_HEIGHT: u32 = 1024;
-    //
-    // var args = try std.process.argsWithAllocator(allocator);
-    // defer args.deinit();
-    //
-    // const program_setup = params: {
-    //     var params = FractalParameters{
-    //         .width = IMAGE_WIDTH,
-    //         .height = IMAGE_HEIGHT,
-    //         .max_iterations = 32,
-    //         .escape_radius = 2.0,
-    //         .xmin = -1.0,
-    //         .xmax = 1.0,
-    //         .ymin = -1.0,
-    //         .ymax = 1.0,
-    //         .c = Cf32{ .re = 0.355, .im = 0.355 },
-    //         .coloring = FractalColoring.BlackWhite,
-    //         .fractal_func = &julia_quadratic,
-    //     };
-    //
-    //     var workers_setup = WorkerConfiguration{
-    //         .workers = 1,
-    //         .shuffle_packages = false,
-    //     };
-    //
-    //     _ = args.skip();
-    //
-    //     while (args.next()) |arg| {
-    //         if (std.mem.startsWith(u8, arg, "--width=")) {
-    //             params.width = std.fmt.parseInt(u32, arg[std.mem.indexOf(u8, arg, "=").? + 1 ..], 10) catch {
-    //                 continue;
-    //             };
-    //         } else if (std.mem.startsWith(u8, arg, "--height=")) {
-    //             params.height = std.fmt.parseInt(u32, arg[std.mem.indexOf(u8, arg, "=").? + 1 ..], 10) catch {
-    //                 continue;
-    //             };
-    //         } else if (std.mem.startsWith(u8, arg, "--iterations=")) {
-    //             params.max_iterations = std.fmt.parseInt(u32, arg[std.mem.indexOf(u8, arg, "=").? + 1 ..], 10) catch {
-    //                 continue;
-    //             };
-    //         } else if (std.mem.startsWith(u8, arg, "--coloring=")) {
-    //             if (std.meta.stringToEnum(FractalColoring, arg[std.mem.indexOf(u8, arg, "=").? + 1 ..])) |coloring| {
-    //                 params.coloring = coloring;
-    //             }
-    //         } else if (std.mem.startsWith(u8, arg, "--origin=")) {
-    //             const eqpos = std.mem.indexOf(u8, arg, "=").? + 1;
-    //             const cstart = arg[eqpos..];
-    //             const comma_pos = std.mem.indexOf(u8, cstart, "x").?;
-    //             params.c = Cf32{
-    //                 .re = std.fmt.parseFloat(f32, cstart[0..comma_pos]) catch {
-    //                     continue;
-    //                 },
-    //                 .im = std.fmt.parseFloat(f32, cstart[comma_pos + 1 ..]) catch {
-    //                     continue;
-    //                 },
-    //             };
-    //         } else if (std.mem.startsWith(u8, arg, "--func=")) {
-    //             if (std.meta.stringToEnum(FractalFunc, arg[std.mem.indexOf(u8, arg, "=").? + 1 ..])) |fractal_fn| {
-    //                 params.fractal_func =
-    //                     switch (fractal_fn) {
-    //                     .Cubic => &julia_cubic,
-    //                     .Quadratic => &julia_quadratic,
-    //                     .Cosine => &julia_cosine,
-    //                     .Sine => &julia_sine,
-    //                 };
-    //             }
-    //         } else if (std.mem.startsWith(u8, arg, "--threads=")) {
-    //             workers_setup.workers = blk: {
-    //                 const cpu_count: u32 = @intCast(std.Thread.getCpuCount() catch 1);
-    //                 const wks = std.fmt.parseInt(u32, arg[std.mem.indexOf(u8, arg, "=").? + 1 ..], 10) catch cpu_count;
-    //                 if (wks == 0) {
-    //                     break :blk cpu_count;
-    //                 } else {
-    //                     break :blk @min(wks, cpu_count * 4);
-    //                 }
-    //             };
-    //         } else if (std.mem.startsWith(u8, arg, "--shufle")) {
-    //             workers_setup.shuffle_packages = true;
-    //         } else {
-    //             try stdout.print("Unrecognized argument! {s}\n", .{arg});
-    //         }
-    //     }
-    //     break :params .{ params, workers_setup };
-    // };
-    //
-    // const params = program_setup[0];
-    // const work_cfg = program_setup[1];
-    //
-    // try stdout.print("Program parameters: {s}, worker threads {d}\n", .{ params, work_cfg.workers });
-    //
-    // var scratch_buf: [1024]u8 = undefined;
-    // const dir_path = try std.fs.selfExeDirPath(&scratch_buf);
-    //
-    // const file_path = try std.fs.path.join(allocator, &[_][]const u8{ dir_path, "mandelbrot.ppm" });
-    // defer allocator.free(file_path);
-    //
-    // var pixels = try allocator.alloc(Pixel, params.width * params.height);
-    // defer allocator.free(pixels);
-    //
-    // if (work_cfg.workers == 1) {
-    //     var timer = try std.time.Timer.start();
-    //     const julia_result = try julia(allocator, &params);
-    //     defer allocator.free(julia_result);
-    //
-    //     for (julia_result, 0..) |jres, idx| {
-    //         pixels[idx] = switch (params.coloring) {
-    //             FractalColoring.BlackWhite => color_simple(&jres, &params),
-    //             FractalColoring.Smooth => color_smooth(&jres, &params),
-    //             FractalColoring.Logarithmic => color_logarithmic(&jres, &params),
-    //         };
-    //     }
-    //     const elapsed_ns = timer.lap();
-    //     try stdout.print(
-    //         "Render time (ST): {d:.2}h :: {d:.2}m :: {d:.2}s\n",
-    //         .{
-    //             @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(std.time.ns_per_hour)),
-    //             @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(std.time.ns_per_min)),
-    //             @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(std.time.ns_per_s)),
-    //         },
-    //     );
-    // } else {
-    //     var timer = try std.time.Timer.start();
-    //     const worker_block_size: u32 = 16;
-    //     std.debug.assert(params.width % worker_block_size == 0);
-    //     std.debug.assert(params.height % worker_block_size == 0);
-    //
-    //     var work_queue = std.ArrayList(WorkPackage).init(allocator);
-    //     defer work_queue.deinit();
-    //
-    //     const pkgs_x = params.width / worker_block_size;
-    //     const pkgs_y = params.height / worker_block_size;
-    //
-    //     var wy: u32 = 0;
-    //     while (wy < pkgs_y) : (wy += 1) {
-    //         var wx: u32 = 0;
-    //         while (wx < pkgs_x) : (wx += 1) {
-    //             try work_queue.append(WorkPackage{
-    //                 .xmin = wx * worker_block_size,
-    //                 .xmax = (wx + 1) * worker_block_size,
-    //                 .ymin = wy * worker_block_size,
-    //                 .ymax = (wy + 1) * worker_block_size,
-    //             });
-    //         }
-    //     }
-    //
-    //     if (work_cfg.shuffle_packages) {
-    //         try stdout.print("Shuffling work packages.\n", .{});
-    //
-    //         var seed: u64 = undefined;
-    //         try std.posix.getrandom(std.mem.asBytes(&seed));
-    //         var rng = std.Random.DefaultPrng.init(seed);
-    //         std.rand.shuffle(rng.random(), WorkPackage, work_queue.items);
-    //     }
-    //
-    //     try stdout.print("Work packages count : {d}\n", .{work_queue.items.len});
-    //
-    //     var worker_threads = std.ArrayList(std.Thread).init(allocator);
-    //     defer worker_threads.deinit();
-    //
-    //     var worker_data = WorkerParams{
-    //         .pixels = pixels,
-    //         .work_queue = work_queue,
-    //         .lock = std.Thread.Mutex{},
-    //     };
-    //
-    //     {
-    //         var i: u32 = 0;
-    //         while (i < work_cfg.workers) : (i += 1) {
-    //             try worker_threads.append(try std.Thread.spawn(.{}, julia_mt, .{ &worker_data, &params }));
-    //         }
-    //     }
-    //
-    //     for (worker_threads.items) |wk| {
-    //         wk.join();
-    //     }
-    //
-    //     const elapsed_ns = timer.lap();
-    //     try stdout.print(
-    //         "Render time (MT - {d} workers): {d:.2}h :: {d:.2}m :: {d:.2}s\n",
-    //         .{
-    //             work_cfg.workers,
-    //             @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(std.time.ns_per_hour)),
-    //             @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(std.time.ns_per_min)),
-    //             @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(std.time.ns_per_s)),
-    //         },
-    //     );
-    // }
-    //
-    // try write_ppm_file(file_path, pixels, params.width, params.height);
-
-    // if (sdl.SDL_Init(sdl.SDL_INIT_VIDEO | sdl.SDL_INIT_EVENTS) != 0)
-    //     @panic("Failed to initialize SDL");
-    //
-    // defer {
-    //     sdl.SDL_Quit();
-    // }
-    //
-    // std.log.info("SDL initialized", .{});
-    // const window = sdl.SDL_CreateWindow(
-    //     "Zig+Vulkan->still doin ur mom!",
-    //     sdl.SDL_WINDOWPOS_CENTERED,
-    //     sdl.SDL_WINDOWPOS_CENTERED,
-    //     1600,
-    //     1200,
-    //     sdl.SDL_WINDOW_BORDERLESS | sdl.SDL_WINDOW_ALLOW_HIGHDPI,
-    // ) orelse {
-    //     @panic("Failed to create SDL window!");
-    // };
-    //
-    // var wmi: sdl.SDL_SysWMInfo = undefined;
-    // wmi.version = sdl.SDL_VERSION;
-    // _ = sdl.SDL_GetWindowWMInfo(window, &wmi);
-    //     sdl.WindowPosition{ .absolute = 0 },
-    //     sdl.WindowPosition{ .absolute = 0 },
-    //     1600,
-    //     1200,
-    //     .{
-    //         .resizable = true,
-    //         .borderless = true,
-    //         .allow_high_dpi = true,
-    //     },
-    // );
-    //
-    // defer {
-    //     window.destroy();
-    // }
-    //
 
     try sdl.init(.{
         .video = true,
@@ -816,411 +626,149 @@ pub fn main() !void {
         sdl.quit();
     }
 
-    const window = try sdl.createWindow("Zig + SDL + Vulkan", .{ .centered = {} }, .{ .centered = {} }, 1600, 1200, .{ .borderless = true, .resizable = false });
-    const wmi = window.getWMInfo();
-    std.log.info("SDL Window created, handle : {?}, win {?}", .{ wmi, wmi.u.win });
-    _ = fba;
+    const window = try sdl.createWindow(
+        "Zig + SDL + Vulkan",
+        .{ .centered = {} },
+        .{ .centered = {} },
+        1600,
+        1200,
+        .{ .borderless = true, .resizable = false },
+    );
 
-    // const vkinstance = create_vk_instance: {
-    //     var exts: u32 = 0;
-    //     _ = gfx.vkEnumerateInstanceExtensionProperties(null, &exts, null);
-    //     var exts_names = try std.ArrayList(gfx.VkExtensionProperties).initCapacity(fba, exts);
-    //     defer {
-    //         exts_names.deinit();
-    //     }
-    //     try exts_names.resize(exts);
-    //     _ = gfx.vkEnumerateInstanceExtensionProperties(null, &exts, @ptrCast(exts_names.items.ptr));
-    //
-    //     for (exts_names.items) |ext_prop| {
-    //         try stdout.print("\nExtension {s} -> {d}", .{ ext_prop.extensionName, ext_prop.specVersion });
-    //     }
-    //
-    //     var layes: u32 = 0;
-    //     _ = gfx.vkEnumerateInstanceLayerProperties(&layes, null);
-    //     var layer_props = try std.ArrayList(gfx.VkLayerProperties).initCapacity(fba, layes);
-    //     defer {
-    //         layer_props.deinit();
-    //     }
-    //     try layer_props.resize(layes);
-    //     _ = gfx.vkEnumerateInstanceLayerProperties(&layes, layer_props.items.ptr);
-    //
-    //     for (layer_props.items) |layer| {
-    //         try stdout.print("\nLayer {s} ({s}) : {d}", .{ layer.layerName, layer.description, layer.specVersion });
-    //     }
-    //
-    //     const enabled_layers = [_][*:0]const u8{"VK_LAYER_KHRONOS_validation"};
-    //     const enabled_extensions = [_][*:0]const u8{
-    //         "VK_KHR_surface",
-    //         if (builtin.os.tag == .windows) "VK_KHR_win32_surface" else "whatever",
-    //         "VK_EXT_debug_utils",
-    //     };
-    //
-    //     const dbg_utils_create_info = gfx.VkDebugUtilsMessengerCreateInfoEXT{
-    //         .sType = gfx.VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
-    //         .pNext = null,
-    //         .flags = 0,
-    //         .messageSeverity = gfx.VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT | gfx.VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT,
-    //         .messageType = gfx.VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | gfx.VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | gfx.VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
-    //         .pfnUserCallback = vk_dbg_utils_msg_callback,
-    //         .pUserData = null,
-    //     };
-    //
-    //     const app_info = gfx.VkApplicationInfo{
-    //         .sType = gfx.VK_STRUCTURE_TYPE_APPLICATION_INFO,
-    //         .pNext = null,
-    //         .pApplicationName = "doing_ur_mom_with_vulkan_from_zig",
-    //         .applicationVersion = gfx.VK_MAKE_API_VERSION(1, 0, 0, 0),
-    //         .pEngineName = "pepega_engine",
-    //         .engineVersion = gfx.VK_MAKE_API_VERSION(1, 0, 0, 0),
-    //         .apiVersion = gfx.VK_API_VERSION_1_3,
-    //     };
-    //
-    //     const inst_create_info = gfx.VkInstanceCreateInfo{
-    //         .sType = gfx.VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-    //         .pNext = &dbg_utils_create_info,
-    //         .flags = 0,
-    //         .pApplicationInfo = &app_info,
-    //         .enabledLayerCount = enabled_layers.len,
-    //         .ppEnabledLayerNames = &enabled_layers,
-    //         .enabledExtensionCount = enabled_extensions.len,
-    //         .ppEnabledExtensionNames = &enabled_extensions,
-    //     };
-    //
-    //     var instance: gfx.VkInstance = null;
-    //     const result = gfx.vkCreateInstance(&inst_create_info, null, &instance);
-    //     if (result != gfx.VK_SUCCESS or instance == null) {
-    //         try stdout.print("Failed to create Vulkan instance! error {x}", .{result});
-    //         return;
-    //     }
-    //
-    //     break :create_vk_instance instance.?;
-    // };
-    //
-    // const surface_khr = create_vulkan_surface(vkinstance, window);
-    // _ = get_physical_device(vkinstance, surface_khr, fba);
+    const vkinstance = create_vk_instance: {
+        var exts: u32 = 0;
+        _ = gfx.vkEnumerateInstanceExtensionProperties(null, &exts, null);
+        var exts_names = try std.ArrayList(gfx.VkExtensionProperties).initCapacity(fba, exts);
+        defer {
+            exts_names.deinit();
+        }
+        try exts_names.resize(exts);
+        _ = gfx.vkEnumerateInstanceExtensionProperties(null, &exts, @ptrCast(exts_names.items.ptr));
 
-    // var renderer = try sdl.createRenderer(window, null, .{ .accelerated = true });
-    // defer {
-    //     renderer.destroy();
-    // }
-    //
-    // event_loop: while (true) {
-    //     if (sdl.pollEvent()) |event| {
-    //         switch (event) {
-    //             .key_down => |keydown| {
-    //                 if (keydown.keycode == sdl.Keycode.escape) {
-    //                     break :event_loop;
-    //                 }
-    //             },
-    //             else => {},
-    //         }
-    //     }
-    //
-    //     try renderer.setColor(sdl.Color.green);
-    //     try renderer.clear();
-    //     renderer.present();
-    // }
-    //
-    // raylib.SetConfigFlags(raylib.FLAG_WINDOW_UNDECORATED | raylib.FLAG_VSYNC_HINT);
-    // raylib.InitWindow(1600, 1200, "Doing UR mom");
-    // defer raylib.CloseWindow();
-    //
-    // const mon = raylib.GetCurrentMonitor();
-    // const mw = raylib.GetMonitorWidth(mon);
-    // const mh = raylib.GetMonitorHeight(mon);
-    // try stdout.print("monitor {d} - [{d} x {d}]", .{ mon, mw, mh });
-    //
-    // const sw = raylib.GetScreenWidth();
-    // const sh = raylib.GetScreenHeight();
-    // const hw: u32 = @intCast(raylib.GetRenderWidth());
-    // const hh: u32 = @intCast(raylib.GetRenderHeight());
-    //
-    // try stdout.print("monitor [{d} x {d}], screen [{d} x {d}], render [{d} x {d}]", .{ mw, mh, sw, sh, hw, hh });
-    //
-    // {
-    //     var y: u32 = 0;
-    //     const fwidth = 1.0 / @as(f32, @floatFromInt(hw));
-    //     const fheight = 1.0 / @as(f32, @floatFromInt(hh));
-    //
-    //     while (y < hh) : (y += 1) {
-    //         var x: u32 = 0;
-    //         const g: u8 = @intFromFloat((@as(f32, @floatFromInt(y)) * fheight) * 255.0);
-    //         while (x < hw) : (x += 1) {
-    //             const r: u8 = @intFromFloat((@as(f32, @floatFromInt(x)) * fwidth) * 255.0);
-    //             g_scratch_buffer[y * hw + x] = raylib.Color{
-    //                 .r = r,
-    //                 .g = g,
-    //                 //.b = @intCast((@as(u32, r) + @as(u32, g)) % 255),
-    //                 .b = 0,
-    //                 .a = 255,
-    //             };
-    //         }
-    //     }
-    // }
-    //
-    // const pixels_texture = blk: {
-    //     const img = raylib.GenImageColor(@intCast(hw), @intCast(hh), raylib.MAGENTA);
-    //     defer raylib.UnloadImage(img);
-    //     const tex = raylib.LoadTextureFromImage(img);
-    //     raylib.UpdateTextureRec(
-    //         tex,
-    //         raylib.Rectangle{
-    //             .x = 0,
-    //             .y = 0,
-    //             .width = @floatFromInt(hw),
-    //             .height = @floatFromInt(hh),
-    //         },
-    //         &g_scratch_buffer,
-    //     );
-    //     break :blk tex;
-    // };
-    //
-    // defer raylib.UnloadTexture(pixels_texture);
-    //
-    // var worker_pool: std.Thread.Pool = undefined;
-    // try std.Thread.Pool.init(&worker_pool, .{ .allocator = allocator, .n_jobs = 8 });
-    // defer {
-    //     worker_pool.deinit();
-    // }
-    //
-    // const params = FractalParameters{
-    //     .width = 1600,
-    //     .height = 1200,
-    //     .max_iterations = 256,
-    //     .escape_radius = 2.0,
-    //     .xmin = -1.0,
-    //     .xmax = 1.0,
-    //     .ymin = -1.0,
-    //     .ymax = 1.0,
-    //     .c = Cf32{ .re = 0.355, .im = 0.355 },
-    //     .coloring = FractalColoring.Smooth,
-    //     .fractal_func = &julia_quadratic,
-    // };
-    //
-    // const worker_block_size: u32 = 16;
-    // std.debug.assert(params.width % worker_block_size == 0);
-    // std.debug.assert(params.height % worker_block_size == 0);
-    //
-    // var work_queue = std.ArrayList(WorkPackage).init(allocator);
-    // defer work_queue.deinit();
-    //
-    // const pkgs_x = params.width / worker_block_size;
-    // const pkgs_y = params.height / worker_block_size;
-    //
-    // var wy: u32 = 0;
-    // while (wy < pkgs_y) : (wy += 1) {
-    //     var wx: u32 = 0;
-    //     while (wx < pkgs_x) : (wx += 1) {
-    //         try work_queue.append(WorkPackage{
-    //             .xmin = wx * worker_block_size,
-    //             .xmax = (wx + 1) * worker_block_size,
-    //             .ymin = wy * worker_block_size,
-    //             .ymax = (wy + 1) * worker_block_size,
-    //         });
-    //     }
-    // }
-    //
-    // const shuffle_packages = true;
-    // if (shuffle_packages) {
-    //     try stdout.print("Shuffling work packages.\n", .{});
-    //
-    //     var seed: u64 = undefined;
-    //     try std.posix.getrandom(std.mem.asBytes(&seed));
-    //     var rng = std.Random.DefaultPrng.init(seed);
-    //     std.rand.shuffle(rng.random(), WorkPackage, work_queue.items);
-    // }
-    //
-    // try stdout.print("Work packages count : {d}\n", .{work_queue.items.len});
-    //
-    // var processed_packages = std.atomic.Value(u32).init(0);
-    // for (work_queue.items) |pkg| {
-    //     try worker_pool.spawn(julia_pool_worker, .{ params, pkg, &processed_packages });
-    // }
-    //
-    // var combo_color_opts = std.ArrayList(u8).init(allocator);
-    // defer {
-    //     combo_color_opts.deinit();
-    // }
-    // inline for (@typeInfo(FractalColoring).Enum.fields) |fld| {
-    //     stdout.print("\nEnum field {s}", .{fld.name}) catch {};
-    //     try combo_color_opts.appendSlice(fld.name);
-    //     try combo_color_opts.append(';');
-    // }
-    //
-    // combo_color_opts.items[combo_color_opts.items.len - 1] = 0;
-    //
-    // const UiState = struct {
-    //     color_opt: i32,
-    //     escape_radius: f32,
-    //     iterations: u32,
-    // };
-    // var ui_state = UiState{
-    //     .color_opt = 0,
-    //     .escape_radius = 2.0,
-    //     .iterations = 32,
-    // };
-    //
-    // var params_changed = false;
-    // while (!raylib.WindowShouldClose()) {
-    //     raylib.BeginDrawing();
-    //     defer {
-    //         raylib.EndDrawing();
-    //     }
-    //
-    //     raylib.ClearBackground(raylib.RAYWHITE);
-    //     raylib.UpdateTextureRec(
-    //         pixels_texture,
-    //         raylib.Rectangle{
-    //             .x = 0,
-    //             .y = 0,
-    //             .width = @floatFromInt(hw),
-    //             .height = @floatFromInt(hh),
-    //         },
-    //         &g_scratch_buffer,
-    //     );
-    //     raylib.DrawTexture(pixels_texture, 0, 0, raylib.WHITE);
-    //
-    //     const processed = processed_packages.load(std.builtin.AtomicOrder.acquire);
-    //     var buf: [256]u8 = undefined;
-    //     _ = try std.fmt.bufPrintZ(&buf, "Processed work items: {d} / {d}", .{ processed, work_queue.items.len });
-    //     raylib.DrawText(&buf, 0, 0, 16, raylib.ORANGE);
-    //
-    //     if (processed != work_queue.items.len) {
-    //         raylib.GuiDisable();
-    //     } else {
-    //         raylib.GuiEnable();
-    //     }
-    //
-    //     if (raylib.GuiSliderBar(
-    //         raylib.Rectangle{ .x = 128, .y = 128, .width = 256, .height = 24 },
-    //         "Doing",
-    //         "UrMom",
-    //         &ui_state.escape_radius,
-    //         2.0,
-    //         64.0,
-    //     ) != 0) {
-    //         params_changed = true;
-    //     }
-    //
-    //     var iter_count: f32 = @floatFromInt(ui_state.iterations);
-    //     if (raylib.GuiSliderBar(
-    //         raylib.Rectangle{ .x = 128, .y = 128 + 24 + 4, .width = 256, .height = 24 },
-    //         "min",
-    //         "max",
-    //         &iter_count,
-    //         8.0,
-    //         8192.0,
-    //     ) != 0) {
-    //         const new_val: u32 = @intFromFloat(@ceil(iter_count));
-    //
-    //         if (new_val != ui_state.iterations) {
-    //             params_changed = true;
-    //             ui_state.iterations = new_val;
-    //         }
-    //     }
-    //
-    //     var prev_color = ui_state.color_opt;
-    //     _ = raylib.GuiComboBox(
-    //         raylib.Rectangle{ .x = 128, .y = 128 + 24 + 4 + 24 + 4, .width = 256, .height = 24 },
-    //         combo_color_opts.items.ptr,
-    //         &prev_color,
-    //     );
-    //
-    //     if (prev_color != ui_state.color_opt) {
-    //         params_changed = true;
-    //         ui_state.color_opt = prev_color;
-    //         stdout.print("Set coloring to {d}...", .{ui_state.color_opt}) catch {};
-    //     }
-    //
-    //     if (raylib.GuiButton(raylib.Rectangle{ .x = 128, .y = 256, .width = 64, .height = 24 }, "Apply changes") != 0 and params_changed) {
-    //         stdout.print("Applying changes...", .{}) catch {};
-    //         params_changed = false;
-    //         const p = FractalParameters{
-    //             .width = 1600,
-    //             .height = 1200,
-    //             .max_iterations = ui_state.iterations,
-    //             .escape_radius = ui_state.escape_radius,
-    //             .xmin = -1.0,
-    //             .xmax = 1.0,
-    //             .ymin = -1.0,
-    //             .ymax = 1.0,
-    //             .c = Cf32{ .re = 0.355, .im = 0.355 },
-    //             .coloring = @enumFromInt(ui_state.color_opt),
-    //             .fractal_func = &julia_quadratic,
-    //         };
-    //
-    //         processed_packages.store(0, std.builtin.AtomicOrder.seq_cst);
-    //         for (work_queue.items) |pkg| {
-    //             try worker_pool.spawn(julia_pool_worker, .{ p, pkg, &processed_packages });
-    //         }
-    //     }
-    // }
+        for (exts_names.items) |ext_prop| {
+            std.log.info("\nExtension {s} -> {d}", .{ ext_prop.extensionName, ext_prop.specVersion });
+        }
+
+        var layes: u32 = 0;
+        _ = gfx.vkEnumerateInstanceLayerProperties(&layes, null);
+        var layer_props = try std.ArrayList(gfx.VkLayerProperties).initCapacity(fba, layes);
+        defer {
+            layer_props.deinit();
+        }
+        try layer_props.resize(layes);
+        _ = gfx.vkEnumerateInstanceLayerProperties(&layes, layer_props.items.ptr);
+
+        for (layer_props.items) |layer| {
+            std.log.info("\nLayer {s} ({s}) : {d}", .{ layer.layerName, layer.description, layer.specVersion });
+        }
+
+        const enabled_layers = [_][*:0]const u8{"VK_LAYER_KHRONOS_validation"};
+        const enabled_extensions = [_][*:0]const u8{
+            "VK_KHR_surface",
+            if (builtin.os.tag == .windows) "VK_KHR_win32_surface" else "whatever",
+            "VK_EXT_debug_utils",
+        };
+
+        const dbg_utils_create_info = gfx.VkDebugUtilsMessengerCreateInfoEXT{
+            .sType = gfx.VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
+            .pNext = null,
+            .flags = 0,
+            .messageSeverity = gfx.VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT | gfx.VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT,
+            .messageType = gfx.VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | gfx.VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | gfx.VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
+            .pfnUserCallback = vk_dbg_utils_msg_callback,
+            .pUserData = null,
+        };
+
+        const app_info = gfx.VkApplicationInfo{
+            .sType = gfx.VK_STRUCTURE_TYPE_APPLICATION_INFO,
+            .pNext = null,
+            .pApplicationName = "doing_ur_mom_with_vulkan_from_zig",
+            .applicationVersion = gfx.VK_MAKE_API_VERSION(1, 0, 0, 0),
+            .pEngineName = "pepega_engine",
+            .engineVersion = gfx.VK_MAKE_API_VERSION(1, 0, 0, 0),
+            .apiVersion = gfx.VK_API_VERSION_1_3,
+        };
+
+        const inst_create_info = gfx.VkInstanceCreateInfo{
+            .sType = gfx.VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+            .pNext = &dbg_utils_create_info,
+            .flags = 0,
+            .pApplicationInfo = &app_info,
+            .enabledLayerCount = enabled_layers.len,
+            .ppEnabledLayerNames = &enabled_layers,
+            .enabledExtensionCount = enabled_extensions.len,
+            .ppEnabledExtensionNames = &enabled_extensions,
+        };
+
+        var instance: gfx.VkInstance = null;
+        const result = gfx.vkCreateInstance(&inst_create_info, null, &instance);
+        if (result != gfx.VK_SUCCESS or instance == null) {
+            std.log.info("Failed to create Vulkan instance! error {x}", .{result});
+            return;
+        }
+
+        break :create_vk_instance instance.?;
+    };
+
+    const surface_khr = create_vulkan_surface(vkinstance, window);
+    const phys_dev = try get_physical_device(vkinstance, surface_khr, fba);
+    _ = phys_dev;
+
+    var renderer = try sdl.createRenderer(window, null, .{ .accelerated = true });
+    defer {
+        renderer.destroy();
+    }
+
+    event_loop: while (true) {
+        if (sdl.pollEvent()) |event| {
+            switch (event) {
+                .key_down => |keydown| {
+                    if (keydown.keycode == sdl.Keycode.escape) {
+                        break :event_loop;
+                    }
+                },
+                else => {},
+            }
+        }
+
+        try renderer.setColor(sdl.Color.green);
+        try renderer.clear();
+        renderer.present();
+    }
 }
 
 const atomic_package_counter_t = std.atomic.Value(u32);
 
-// fn julia_pool_worker(params: FractalParameters, pkg: WorkPackage, pkg_counter: *atomic_package_counter_t) void {
-//     var y: u32 = pkg.ymin;
-//     while (y < pkg.ymax) : (y += 1) {
-//         var x: u32 = pkg.xmin;
-//         while (x < pkg.xmax) : (x += 1) {
-//             const z = screen_coord_to_complex(
-//                 @floatFromInt(x),
-//                 @floatFromInt(y),
-//                 params.xmin,
-//                 params.xmax,
-//                 params.ymin,
-//                 params.ymax,
-//                 @floatFromInt(params.width),
-//                 @floatFromInt(params.height),
-//             );
-//
-//             const iteration_result = params.fractal_func(x, y, z, params.c, &params);
-//             g_scratch_buffer[y * params.width + x] = blk: {
-//                 const pixel = switch (params.coloring) {
-//                     FractalColoring.BlackWhite => color_simple(&iteration_result, &params),
-//                     FractalColoring.Smooth => color_smooth(&iteration_result, &params),
-//                     FractalColoring.Logarithmic => color_logarithmic(&iteration_result, &params),
-//                 };
-//                 break :blk raylib.Color{ .r = pixel.r, .g = pixel.g, .b = pixel.b, .a = 255 };
-//             };
-//         }
-//     }
-//
-//     _ = pkg_counter.fetchAdd(1, std.builtin.AtomicOrder.release);
-// }
-//
-// fn create_vulkan_surface(vkinst: gfx.VkInstance, window: *sdl.SDL_Window) gfx.VkSurfaceKHR {
-//     switch (builtin.os.tag) {
-//         .windows => {
-//             var wmi: sdl.SDL_SysWMInfo = undefined;
-//             wmi.version = sdl.SDL_VERSION;
-//             if (sdl.SDL_GetWindowWMInfo(window, &wmi) != sdl.SDL_TRUE) {
-//                 @panic("Cant get platfowm window info!");
-//             }
-//
-//             std.log.info("HINSTANCE 0x{x:0>8}, WIN 0x{x:0>8}", .{ @intFromPtr(wmi.u.win.hinstance), @intFromPtr(wmi.u.win.window) });
-//
-//             const surface_create_info = gfx.VkWin32SurfaceCreateInfoKHR{
-//                 .sType = gfx.VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR,
-//                 .pNext = null,
-//                 .flags = 0,
-//                 .hinstance = @ptrFromInt(@intFromPtr(wmi.u.win.hinstance)),
-//                 //@alignCast(@ptrCast(wmi.u.win.hinstance)),
-//                 .hwnd = @ptrFromInt(@intFromPtr(wmi.u.win.window)),
-//                 // @alignCast(@ptrCast(wmi.u.win.window)),
-//             };
-//
-//             var surface: gfx.VkSurfaceKHR = null;
-//             const result = gfx.vkCreateWin32SurfaceKHR(vkinst, &surface_create_info, null, &surface);
-//             if (result != gfx.VK_SUCCESS) {
-//                 std.log.err("Failed to create surface, error {d}", .{result});
-//                 @panic("Fatal error");
-//             }
-//
-//             std.log.info("Created VkSurfaceKHR {any}", .{surface});
-//             return surface;
-//         },
-//         else => @panic("Not implemented for this platform!"),
-//     }
-// }
+fn create_vulkan_surface(vkinst: gfx.VkInstance, window: sdl.Window) gfx.VkSurfaceKHR {
+    switch (builtin.os.tag) {
+        .windows => {
+            const wmi = window.getWMInfo() catch {
+                @panic("Failed to get window data!");
+            };
+
+            std.log.info(
+                "HINSTANCE 0x{x:0>8}, WIN 0x{x:0>8}",
+                .{ @intFromPtr(wmi.u.win.hinstance), @intFromPtr(wmi.u.win.window) },
+            );
+
+            const surface_create_info = gfx.VkWin32SurfaceCreateInfoKHR{
+                .sType = gfx.VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR,
+                .pNext = null,
+                .flags = 0,
+                .hinstance = @alignCast(@ptrCast(wmi.u.win.hinstance)),
+                .hwnd = @alignCast(@ptrCast(wmi.u.win.window)),
+            };
+
+            var surface: gfx.VkSurfaceKHR = null;
+            const result = gfx.vkCreateWin32SurfaceKHR(vkinst, &surface_create_info, null, &surface);
+            if (result != gfx.VK_SUCCESS) {
+                std.log.err("Failed to create surface, error {d}", .{result});
+                @panic("Fatal error");
+            }
+
+            std.log.info("Created VkSurfaceKHR {any}", .{surface});
+            return surface;
+        },
+        else => @panic("Not implemented for this platform!"),
+    }
+}
