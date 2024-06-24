@@ -577,7 +577,6 @@ pub fn main() !void {
     var fba_alloc = std.heap.FixedBufferAllocator.init(&g_scratch_buffer);
     const fba = fba_alloc.allocator();
     //
-    var stdout = std.io.getStdOut().writer();
     //
     // const IMAGE_WIDTH: u32 = 1024;
     // const IMAGE_HEIGHT: u32 = 1024;
@@ -769,28 +768,29 @@ pub fn main() !void {
     // }
     //
     // try write_ppm_file(file_path, pixels, params.width, params.height);
-    if (sdl.SDL_Init(sdl.SDL_INIT_VIDEO | sdl.SDL_INIT_EVENTS) != 0)
-        @panic("Failed to initialize SDL");
 
-    defer {
-        sdl.SDL_Quit();
-    }
-
-    std.log.info("SDL initialized", .{});
-    const window = sdl.SDL_CreateWindow(
-        "Zig+Vulkan->still doin ur mom!",
-        sdl.SDL_WINDOWPOS_CENTERED,
-        sdl.SDL_WINDOWPOS_CENTERED,
-        1600,
-        1200,
-        sdl.SDL_WINDOW_BORDERLESS | sdl.SDL_WINDOW_ALLOW_HIGHDPI,
-    ) orelse {
-        @panic("Failed to create SDL window!");
-    };
-
-    var wmi: sdl.SDL_SysWMInfo = undefined;
-    wmi.version = sdl.SDL_VERSION;
-    _ = sdl.SDL_GetWindowWMInfo(window, &wmi);
+    // if (sdl.SDL_Init(sdl.SDL_INIT_VIDEO | sdl.SDL_INIT_EVENTS) != 0)
+    //     @panic("Failed to initialize SDL");
+    //
+    // defer {
+    //     sdl.SDL_Quit();
+    // }
+    //
+    // std.log.info("SDL initialized", .{});
+    // const window = sdl.SDL_CreateWindow(
+    //     "Zig+Vulkan->still doin ur mom!",
+    //     sdl.SDL_WINDOWPOS_CENTERED,
+    //     sdl.SDL_WINDOWPOS_CENTERED,
+    //     1600,
+    //     1200,
+    //     sdl.SDL_WINDOW_BORDERLESS | sdl.SDL_WINDOW_ALLOW_HIGHDPI,
+    // ) orelse {
+    //     @panic("Failed to create SDL window!");
+    // };
+    //
+    // var wmi: sdl.SDL_SysWMInfo = undefined;
+    // wmi.version = sdl.SDL_VERSION;
+    // _ = sdl.SDL_GetWindowWMInfo(window, &wmi);
     //     sdl.WindowPosition{ .absolute = 0 },
     //     sdl.WindowPosition{ .absolute = 0 },
     //     1600,
@@ -806,95 +806,98 @@ pub fn main() !void {
     //     window.destroy();
     // }
     //
-    std.log.info("SDL Window created, handle : {?}", .{wmi});
 
-    // const wsi_info = switch (builtin.os.tag) {
-    //     .windows => VulkanWsiCreateInfo{
-    //         .win32 = .{
-    //             .hwnd = wminfo.u.win.window,
-    //             .hinstance = wminfo.u.win.hinstance,
-    //         },
-    //     },
-    //     else => @panic("Not implemented for this platform !!"),
+    try sdl.init(.{
+        .video = true,
+        .events = true,
+        .game_controller = true,
+    });
+    defer {
+        sdl.quit();
+    }
+
+    const window = try sdl.createWindow("Zig + SDL + Vulkan", .{ .centered = {} }, .{ .centered = {} }, 1600, 1200, .{ .borderless = true, .resizable = false });
+    const wmi = window.getWMInfo();
+    std.log.info("SDL Window created, handle : {?}, win {?}", .{ wmi, wmi.u.win });
+    _ = fba;
+
+    // const vkinstance = create_vk_instance: {
+    //     var exts: u32 = 0;
+    //     _ = gfx.vkEnumerateInstanceExtensionProperties(null, &exts, null);
+    //     var exts_names = try std.ArrayList(gfx.VkExtensionProperties).initCapacity(fba, exts);
+    //     defer {
+    //         exts_names.deinit();
+    //     }
+    //     try exts_names.resize(exts);
+    //     _ = gfx.vkEnumerateInstanceExtensionProperties(null, &exts, @ptrCast(exts_names.items.ptr));
+    //
+    //     for (exts_names.items) |ext_prop| {
+    //         try stdout.print("\nExtension {s} -> {d}", .{ ext_prop.extensionName, ext_prop.specVersion });
+    //     }
+    //
+    //     var layes: u32 = 0;
+    //     _ = gfx.vkEnumerateInstanceLayerProperties(&layes, null);
+    //     var layer_props = try std.ArrayList(gfx.VkLayerProperties).initCapacity(fba, layes);
+    //     defer {
+    //         layer_props.deinit();
+    //     }
+    //     try layer_props.resize(layes);
+    //     _ = gfx.vkEnumerateInstanceLayerProperties(&layes, layer_props.items.ptr);
+    //
+    //     for (layer_props.items) |layer| {
+    //         try stdout.print("\nLayer {s} ({s}) : {d}", .{ layer.layerName, layer.description, layer.specVersion });
+    //     }
+    //
+    //     const enabled_layers = [_][*:0]const u8{"VK_LAYER_KHRONOS_validation"};
+    //     const enabled_extensions = [_][*:0]const u8{
+    //         "VK_KHR_surface",
+    //         if (builtin.os.tag == .windows) "VK_KHR_win32_surface" else "whatever",
+    //         "VK_EXT_debug_utils",
+    //     };
+    //
+    //     const dbg_utils_create_info = gfx.VkDebugUtilsMessengerCreateInfoEXT{
+    //         .sType = gfx.VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
+    //         .pNext = null,
+    //         .flags = 0,
+    //         .messageSeverity = gfx.VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT | gfx.VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT,
+    //         .messageType = gfx.VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | gfx.VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | gfx.VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
+    //         .pfnUserCallback = vk_dbg_utils_msg_callback,
+    //         .pUserData = null,
+    //     };
+    //
+    //     const app_info = gfx.VkApplicationInfo{
+    //         .sType = gfx.VK_STRUCTURE_TYPE_APPLICATION_INFO,
+    //         .pNext = null,
+    //         .pApplicationName = "doing_ur_mom_with_vulkan_from_zig",
+    //         .applicationVersion = gfx.VK_MAKE_API_VERSION(1, 0, 0, 0),
+    //         .pEngineName = "pepega_engine",
+    //         .engineVersion = gfx.VK_MAKE_API_VERSION(1, 0, 0, 0),
+    //         .apiVersion = gfx.VK_API_VERSION_1_3,
+    //     };
+    //
+    //     const inst_create_info = gfx.VkInstanceCreateInfo{
+    //         .sType = gfx.VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+    //         .pNext = &dbg_utils_create_info,
+    //         .flags = 0,
+    //         .pApplicationInfo = &app_info,
+    //         .enabledLayerCount = enabled_layers.len,
+    //         .ppEnabledLayerNames = &enabled_layers,
+    //         .enabledExtensionCount = enabled_extensions.len,
+    //         .ppEnabledExtensionNames = &enabled_extensions,
+    //     };
+    //
+    //     var instance: gfx.VkInstance = null;
+    //     const result = gfx.vkCreateInstance(&inst_create_info, null, &instance);
+    //     if (result != gfx.VK_SUCCESS or instance == null) {
+    //         try stdout.print("Failed to create Vulkan instance! error {x}", .{result});
+    //         return;
+    //     }
+    //
+    //     break :create_vk_instance instance.?;
     // };
-
-    const vkinstance = create_vk_instance: {
-        var exts: u32 = 0;
-        _ = gfx.vkEnumerateInstanceExtensionProperties(null, &exts, null);
-        var exts_names = try std.ArrayList(gfx.VkExtensionProperties).initCapacity(fba, exts);
-        defer {
-            exts_names.deinit();
-        }
-        try exts_names.resize(exts);
-        _ = gfx.vkEnumerateInstanceExtensionProperties(null, &exts, @ptrCast(exts_names.items.ptr));
-
-        for (exts_names.items) |ext_prop| {
-            try stdout.print("\nExtension {s} -> {d}", .{ ext_prop.extensionName, ext_prop.specVersion });
-        }
-
-        var layes: u32 = 0;
-        _ = gfx.vkEnumerateInstanceLayerProperties(&layes, null);
-        var layer_props = try std.ArrayList(gfx.VkLayerProperties).initCapacity(fba, layes);
-        defer {
-            layer_props.deinit();
-        }
-        try layer_props.resize(layes);
-        _ = gfx.vkEnumerateInstanceLayerProperties(&layes, layer_props.items.ptr);
-
-        for (layer_props.items) |layer| {
-            try stdout.print("\nLayer {s} ({s}) : {d}", .{ layer.layerName, layer.description, layer.specVersion });
-        }
-
-        const enabled_layers = [_][*:0]const u8{"VK_LAYER_KHRONOS_validation"};
-        const enabled_extensions = [_][*:0]const u8{
-            "VK_KHR_surface",
-            if (builtin.os.tag == .windows) "VK_KHR_win32_surface" else "whatever",
-            "VK_EXT_debug_utils",
-        };
-
-        const dbg_utils_create_info = gfx.VkDebugUtilsMessengerCreateInfoEXT{
-            .sType = gfx.VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
-            .pNext = null,
-            .flags = 0,
-            .messageSeverity = gfx.VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT | gfx.VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT,
-            .messageType = gfx.VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | gfx.VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | gfx.VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
-            .pfnUserCallback = vk_dbg_utils_msg_callback,
-            .pUserData = null,
-        };
-
-        const app_info = gfx.VkApplicationInfo{
-            .sType = gfx.VK_STRUCTURE_TYPE_APPLICATION_INFO,
-            .pNext = null,
-            .pApplicationName = "doing_ur_mom_with_vulkan_from_zig",
-            .applicationVersion = gfx.VK_MAKE_API_VERSION(1, 0, 0, 0),
-            .pEngineName = "pepega_engine",
-            .engineVersion = gfx.VK_MAKE_API_VERSION(1, 0, 0, 0),
-            .apiVersion = gfx.VK_API_VERSION_1_3,
-        };
-
-        const inst_create_info = gfx.VkInstanceCreateInfo{
-            .sType = gfx.VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-            .pNext = &dbg_utils_create_info,
-            .flags = 0,
-            .pApplicationInfo = &app_info,
-            .enabledLayerCount = enabled_layers.len,
-            .ppEnabledLayerNames = &enabled_layers,
-            .enabledExtensionCount = enabled_extensions.len,
-            .ppEnabledExtensionNames = &enabled_extensions,
-        };
-
-        var instance: gfx.VkInstance = null;
-        const result = gfx.vkCreateInstance(&inst_create_info, null, &instance);
-        if (result != gfx.VK_SUCCESS or instance == null) {
-            try stdout.print("Failed to create Vulkan instance! error {x}", .{result});
-            return;
-        }
-
-        break :create_vk_instance instance.?;
-    };
-
-    const surface_khr = create_vulkan_surface(vkinstance, window);
-    _ = get_physical_device(vkinstance, surface_khr, fba);
+    //
+    // const surface_khr = create_vulkan_surface(vkinstance, window);
+    // _ = get_physical_device(vkinstance, surface_khr, fba);
 
     // var renderer = try sdl.createRenderer(window, null, .{ .accelerated = true });
     // defer {
@@ -1187,37 +1190,37 @@ const atomic_package_counter_t = std.atomic.Value(u32);
 //     _ = pkg_counter.fetchAdd(1, std.builtin.AtomicOrder.release);
 // }
 //
-fn create_vulkan_surface(vkinst: gfx.VkInstance, window: *sdl.SDL_Window) gfx.VkSurfaceKHR {
-    switch (builtin.os.tag) {
-        .windows => {
-            var wmi: sdl.SDL_SysWMInfo = undefined;
-            wmi.version = sdl.SDL_VERSION;
-            if (sdl.SDL_GetWindowWMInfo(window, &wmi) != sdl.SDL_TRUE) {
-                @panic("Cant get platfowm window info!");
-            }
-
-            std.log.info("HINSTANCE 0x{x:0>8}, WIN 0x{x:0>8}", .{ @intFromPtr(wmi.u.win.hinstance), @intFromPtr(wmi.u.win.window) });
-
-            const surface_create_info = gfx.VkWin32SurfaceCreateInfoKHR{
-                .sType = gfx.VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR,
-                .pNext = null,
-                .flags = 0,
-                .hinstance = @ptrFromInt(@intFromPtr(wmi.u.win.hinstance)),
-                //@alignCast(@ptrCast(wmi.u.win.hinstance)),
-                .hwnd = @ptrFromInt(@intFromPtr(wmi.u.win.window)),
-                // @alignCast(@ptrCast(wmi.u.win.window)),
-            };
-
-            var surface: gfx.VkSurfaceKHR = null;
-            const result = gfx.vkCreateWin32SurfaceKHR(vkinst, &surface_create_info, null, &surface);
-            if (result != gfx.VK_SUCCESS) {
-                std.log.err("Failed to create surface, error {d}", .{result});
-                @panic("Fatal error");
-            }
-
-            std.log.info("Created VkSurfaceKHR {any}", .{surface});
-            return surface;
-        },
-        else => @panic("Not implemented for this platform!"),
-    }
-}
+// fn create_vulkan_surface(vkinst: gfx.VkInstance, window: *sdl.SDL_Window) gfx.VkSurfaceKHR {
+//     switch (builtin.os.tag) {
+//         .windows => {
+//             var wmi: sdl.SDL_SysWMInfo = undefined;
+//             wmi.version = sdl.SDL_VERSION;
+//             if (sdl.SDL_GetWindowWMInfo(window, &wmi) != sdl.SDL_TRUE) {
+//                 @panic("Cant get platfowm window info!");
+//             }
+//
+//             std.log.info("HINSTANCE 0x{x:0>8}, WIN 0x{x:0>8}", .{ @intFromPtr(wmi.u.win.hinstance), @intFromPtr(wmi.u.win.window) });
+//
+//             const surface_create_info = gfx.VkWin32SurfaceCreateInfoKHR{
+//                 .sType = gfx.VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR,
+//                 .pNext = null,
+//                 .flags = 0,
+//                 .hinstance = @ptrFromInt(@intFromPtr(wmi.u.win.hinstance)),
+//                 //@alignCast(@ptrCast(wmi.u.win.hinstance)),
+//                 .hwnd = @ptrFromInt(@intFromPtr(wmi.u.win.window)),
+//                 // @alignCast(@ptrCast(wmi.u.win.window)),
+//             };
+//
+//             var surface: gfx.VkSurfaceKHR = null;
+//             const result = gfx.vkCreateWin32SurfaceKHR(vkinst, &surface_create_info, null, &surface);
+//             if (result != gfx.VK_SUCCESS) {
+//                 std.log.err("Failed to create surface, error {d}", .{result});
+//                 @panic("Fatal error");
+//             }
+//
+//             std.log.info("Created VkSurfaceKHR {any}", .{surface});
+//             return surface;
+//         },
+//         else => @panic("Not implemented for this platform!"),
+//     }
+// }

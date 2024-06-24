@@ -58,7 +58,7 @@ pub fn build(b: *std.Build) void {
 
     const sdl_sdk = sdl.init(b, null);
     sdl_sdk.link(exe, .static);
-    exe.root_module.addImport("sdl2", sdl_sdk.getNativeModule());
+    exe.root_module.addImport("sdl2", sdl_sdk.getWrapperModule());
 
     const zigwin32 = b.dependency("zigwin32", .{});
     exe.root_module.addImport("zigwin32", zigwin32.module("zigwin32"));
