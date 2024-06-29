@@ -308,6 +308,255 @@ const WorkerConfiguration = struct {
 
 var g_scratch_buffer: [8192 * 8192]u8 = undefined;
 
+fn vk_dbg_utils_msg_callback(
+    severity: gfx.VkDebugUtilsMessageSeverityFlagBitsEXT,
+    msg_types: gfx.VkDebugUtilsMessageTypeFlagBitsEXT,
+    cb_data: [*c]const gfx.VkDebugUtilsMessengerCallbackDataEXT,
+    user: ?*anyopaque,
+) callconv(.C) gfx.VkBool32 {
+    _ = msg_types;
+    _ = user;
+
+    if ((severity & gfx.VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) != 0) {
+        std.log.warn("\n[Vulkan] {d}:{s}:{s}", .{ cb_data[0].messageIdNumber, cb_data[0].pMessageIdName, cb_data[0].pMessage });
+    } else if ((severity & gfx.VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) != 0) {
+        std.log.err("\n[Vulkan] {d}:{s}:{s}", .{ cb_data[0].messageIdNumber, cb_data[0].pMessageIdName, cb_data[0].pMessage });
+    } else {
+        std.log.info("\n[Vulkan] {d}:{s}:{s}", .{ cb_data[0].messageIdNumber, cb_data[0].pMessageIdName, cb_data[0].pMessage });
+    }
+
+    return gfx.VK_FALSE;
+}
+
+const AllocatorBundle = struct {
+    gpa: *std.mem.Allocator,
+    fixed: *std.heap.FixedBufferAllocator,
+};
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var allocator = gpa.allocator();
+    defer {
+        _ = gpa.deinit();
+    }
+
+    var fba_alloc = std.heap.FixedBufferAllocator.init(&g_scratch_buffer);
+    //var fba = fba_alloc.allocator();
+
+    const alloc_bundle = AllocatorBundle{
+        .gpa = &allocator,
+        .fixed = &fba_alloc,
+    };
+
+    try sdl.init(.{
+        .video = true,
+        .events = true,
+        .game_controller = true,
+    });
+    defer {
+        sdl.quit();
+    }
+
+    const window = try sdl.createWindow(
+        "Zig + SDL + Vulkan",
+        .{ .centered = {} },
+        .{ .centered = {} },
+        1600,
+        1200,
+        .{ .borderless = true, .resizable = false },
+    );
+
+    const vulkan_renderer = try VulkanRenderer.init(window, alloc_bundle);
+    defer {
+        vulkan_renderer.deinit();
+    }
+
+    // const vkinstance = try create_vulkan_instance(fba);
+    // const surface_khr = try create_vulkan_surface(vkinstance, window);
+    // std.log.info("Create Vulkan surface (VkSurfaceKHR @ 0x{x:8>})", .{@intFromPtr(surface_khr)});
+    //
+    // const phys_dev = try get_physical_device(vkinstance, surface_khr, fba);
+    // const device = try create_logical_device(&phys_dev);
+    // defer {
+    //     device.deinit();
+    // }
+    //
+    // std.log.info(
+    //     "Created logical device @ 0x{x:8>}, queue @ 0x{x:8>}",
+    //     .{ @intFromPtr(device.device), @intFromPtr(device.queue) },
+    // );
+    //
+    // const swapchain_data = try SwapchainState.init(&device, null, &phys_dev, allocator);
+    // errdefer {
+    //     swapchain_data.deinit(device.device);
+    // }
+
+    var renderer = try sdl.createRenderer(window, null, .{ .accelerated = true });
+    defer {
+        renderer.destroy();
+    }
+
+    const wmi = window.getWMInfo() catch {
+        @panic("Failed to get window data!");
+    };
+    std.log.info("X11 display 0x{x:8>}, window {d}", .{ @intFromPtr(wmi.u.x11.display), wmi.u.x11.window });
+
+    event_loop: while (true) {
+        if (sdl.pollEvent()) |event| {
+            switch (event) {
+                .key_down => |keydown| {
+                    if (keydown.keycode == sdl.Keycode.escape) {
+                        break :event_loop;
+                    }
+                },
+                else => {},
+            }
+        }
+
+        try renderer.setColor(sdl.Color.green);
+        try renderer.clear();
+        renderer.present();
+    }
+}
+
+const atomic_package_counter_t = std.atomic.Value(u32);
+
+fn create_vulkan_instance(fba: std.mem.Allocator) !gfx.VkInstance {
+    {
+        //
+        // print available extensions
+        var exts: u32 = 0;
+        _ = gfx.vkEnumerateInstanceExtensionProperties(null, &exts, null);
+        var exts_names = try std.ArrayList(gfx.VkExtensionProperties).initCapacity(fba, exts);
+        defer {
+            exts_names.deinit();
+        }
+        try exts_names.resize(exts);
+        _ = gfx.vkEnumerateInstanceExtensionProperties(null, &exts, @ptrCast(exts_names.items.ptr));
+
+        for (exts_names.items) |ext_prop| {
+            std.log.info("\nExtension {s} -> {d}", .{ ext_prop.extensionName, ext_prop.specVersion });
+        }
+    }
+
+    {
+        //
+        // print available layers
+        var layes: u32 = 0;
+        _ = gfx.vkEnumerateInstanceLayerProperties(&layes, null);
+        var layer_props = try std.ArrayList(gfx.VkLayerProperties).initCapacity(fba, layes);
+        defer {
+            layer_props.deinit();
+        }
+        try layer_props.resize(layes);
+        _ = gfx.vkEnumerateInstanceLayerProperties(&layes, layer_props.items.ptr);
+
+        for (layer_props.items) |layer| {
+            std.log.info("\nLayer {s} ({s}) : {d}", .{ layer.layerName, layer.description, layer.specVersion });
+        }
+    }
+
+    const enabled_layers = [_][*:0]const u8{"VK_LAYER_KHRONOS_validation"};
+    const enabled_extensions = [_][*:0]const u8{
+        "VK_KHR_surface",
+        switch (builtin.os.tag) {
+            .windows => "VK_KHR_win32_surface",
+            .linux => "VK_KHR_xlib_surface",
+            else => @panic("Platform not supported yet!"),
+        },
+        "VK_EXT_debug_utils",
+    };
+
+    const dbg_utils_create_info = gfx.VkDebugUtilsMessengerCreateInfoEXT{
+        .sType = gfx.VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
+        .pNext = null,
+        .flags = 0,
+        .messageSeverity = gfx.VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT | gfx.VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT,
+        .messageType = gfx.VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | gfx.VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | gfx.VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
+        .pfnUserCallback = vk_dbg_utils_msg_callback,
+        .pUserData = null,
+    };
+
+    const app_info = gfx.VkApplicationInfo{
+        .sType = gfx.VK_STRUCTURE_TYPE_APPLICATION_INFO,
+        .pNext = null,
+        .pApplicationName = "zig_vk_app",
+        .applicationVersion = gfx.VK_MAKE_API_VERSION(1, 0, 0, 0),
+        .pEngineName = "zig_vk_engine",
+        .engineVersion = gfx.VK_MAKE_API_VERSION(1, 0, 0, 0),
+        .apiVersion = gfx.VK_API_VERSION_1_3,
+    };
+
+    const inst_create_info = gfx.VkInstanceCreateInfo{
+        .sType = gfx.VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+        .pNext = &dbg_utils_create_info,
+        .flags = 0,
+        .pApplicationInfo = &app_info,
+        .enabledLayerCount = enabled_layers.len,
+        .ppEnabledLayerNames = &enabled_layers,
+        .enabledExtensionCount = enabled_extensions.len,
+        .ppEnabledExtensionNames = &enabled_extensions,
+    };
+
+    var instance: gfx.VkInstance = null;
+    const result = gfx.vkCreateInstance(&inst_create_info, null, &instance);
+    if (result != gfx.VK_SUCCESS or instance == null) {
+        std.log.info("Failed to create Vulkan instance! error {x}", .{result});
+        return error.VulkanApiError;
+    }
+
+    std.log.info("Vulkan instance created @ 0x{x:8>}", .{@intFromPtr(instance)});
+    return instance;
+}
+
+fn create_vulkan_surface(vkinst: gfx.VkInstance, window: sdl.Window) !gfx.VkSurfaceKHR {
+    const wmi = try window.getWMInfo();
+
+    const surface_handle, const result = make_surface: {
+        switch (builtin.os.tag) {
+            .windows => {
+                std.log.info("HINSTANCE 0x{x:0>8}, WIN 0x{x:0>8}", .{ @intFromPtr(wmi.u.win.hinstance), @intFromPtr(wmi.u.win.window) });
+
+                const surface_create_info = gfx.VkWin32SurfaceCreateInfoKHR{
+                    .sType = gfx.VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR,
+                    .pNext = null,
+                    .flags = 0,
+                    .hinstance = @alignCast(@ptrCast(wmi.u.win.hinstance)),
+                    .hwnd = @alignCast(@ptrCast(wmi.u.win.window)),
+                };
+
+                var surface: gfx.VkSurfaceKHR = null;
+                const result = gfx.vkCreateWin32SurfaceKHR(vkinst, &surface_create_info, null, &surface);
+                break :make_surface .{ surface, result };
+            },
+            .linux => {
+                std.log.info(
+                    "X11 display 0x{x:8>}, window {d}",
+                    .{ @intFromPtr(wmi.u.x11.display), wmi.u.x11.window },
+                );
+                const xlib_surface_create_info = gfx.VkXlibSurfaceCreateInfoKHR{
+                    .sType = gfx.VK_STRUCTURE_TYPE_XLIB_SURFACE_CREATE_INFO_KHR,
+                    .pNext = null,
+                    .flags = 0,
+                    .dpy = @ptrCast(wmi.u.x11.display),
+                    .window = wmi.u.x11.window,
+                };
+                var xlib_surface: gfx.VkSurfaceKHR = null;
+                const result = gfx.vkCreateXlibSurfaceKHR(vkinst, &xlib_surface_create_info, null, &xlib_surface);
+                break :make_surface .{ xlib_surface, result };
+            },
+            else => @panic("Not implemented for this platform!"),
+        }
+    };
+
+    if (result != gfx.VK_SUCCESS or surface_handle == null) {
+        std.log.err("Failed to create VkSurfaceKHR, error {d}", .{result});
+        return error.VulkanApiError;
+    }
+
+    return surface_handle;
+}
+
 const GraphicsSystemError = error{
     NoSuitableDeviceFound,
     VulkanApiError,
@@ -384,26 +633,6 @@ const PhysicalDeviceData = struct {
     }
 };
 
-fn vk_dbg_utils_msg_callback(
-    severity: gfx.VkDebugUtilsMessageSeverityFlagBitsEXT,
-    msg_types: gfx.VkDebugUtilsMessageTypeFlagBitsEXT,
-    cb_data: [*c]const gfx.VkDebugUtilsMessengerCallbackDataEXT,
-    user: ?*anyopaque,
-) callconv(.C) gfx.VkBool32 {
-    _ = msg_types;
-    _ = user;
-
-    if ((severity & gfx.VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) != 0) {
-        std.log.warn("\n[Vulkan] {d}:{s}:{s}", .{ cb_data[0].messageIdNumber, cb_data[0].pMessageIdName, cb_data[0].pMessage });
-    } else if ((severity & gfx.VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) != 0) {
-        std.log.err("\n[Vulkan] {d}:{s}:{s}", .{ cb_data[0].messageIdNumber, cb_data[0].pMessageIdName, cb_data[0].pMessage });
-    } else {
-        std.log.info("\n[Vulkan] {d}:{s}:{s}", .{ cb_data[0].messageIdNumber, cb_data[0].pMessageIdName, cb_data[0].pMessage });
-    }
-
-    return gfx.VK_FALSE;
-}
-
 const PhysicalDeviceWithSurfaceData = struct {
     pdd: PhysicalDeviceData,
     surface: gfx.VkSurfaceKHR,
@@ -457,7 +686,10 @@ fn get_physical_device(vkinst: gfx.VkInstance, surface: gfx.VkSurfaceKHR, alloca
         );
 
         if (!pdd.check_feature_support()) {
-            std.log.info("Rejecting device {s}, does not support all required features.", .{pdd.props.properties.deviceName});
+            std.log.info(
+                "Rejecting device {s}, does not support all required features.",
+                .{pdd.props.properties.deviceName},
+            );
             continue;
         }
 
@@ -607,168 +839,638 @@ fn get_physical_device(vkinst: gfx.VkInstance, surface: gfx.VkSurfaceKHR, alloca
     return pdd;
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    // const allocator = gpa.allocator();
-    defer {
-        _ = gpa.deinit();
+const LogicalDeviceState = struct {
+    device: gfx.VkDevice,
+    queue_family: u32,
+    queue_idx: u32,
+    queue: gfx.VkQueue,
+
+    pub fn deinit(self: *const LogicalDeviceState) void {
+        gfx.vkDestroyDevice(self.device, null);
     }
+};
 
-    var fba_alloc = std.heap.FixedBufferAllocator.init(&g_scratch_buffer);
-    const fba = fba_alloc.allocator();
+fn create_logical_device(ds: *const PhysicalDeviceWithSurfaceData) !LogicalDeviceState {
+    const queue_priorities = [_]f32{1.0};
 
-    try sdl.init(.{
-        .video = true,
-        .events = true,
-        .game_controller = true,
-    });
-    defer {
-        sdl.quit();
-    }
-
-    const window = try sdl.createWindow(
-        "Zig + SDL + Vulkan",
-        .{ .centered = {} },
-        .{ .centered = {} },
-        1600,
-        1200,
-        .{ .borderless = true, .resizable = false },
-    );
-
-    const vkinstance = create_vk_instance: {
-        var exts: u32 = 0;
-        _ = gfx.vkEnumerateInstanceExtensionProperties(null, &exts, null);
-        var exts_names = try std.ArrayList(gfx.VkExtensionProperties).initCapacity(fba, exts);
-        defer {
-            exts_names.deinit();
-        }
-        try exts_names.resize(exts);
-        _ = gfx.vkEnumerateInstanceExtensionProperties(null, &exts, @ptrCast(exts_names.items.ptr));
-
-        for (exts_names.items) |ext_prop| {
-            std.log.info("\nExtension {s} -> {d}", .{ ext_prop.extensionName, ext_prop.specVersion });
-        }
-
-        var layes: u32 = 0;
-        _ = gfx.vkEnumerateInstanceLayerProperties(&layes, null);
-        var layer_props = try std.ArrayList(gfx.VkLayerProperties).initCapacity(fba, layes);
-        defer {
-            layer_props.deinit();
-        }
-        try layer_props.resize(layes);
-        _ = gfx.vkEnumerateInstanceLayerProperties(&layes, layer_props.items.ptr);
-
-        for (layer_props.items) |layer| {
-            std.log.info("\nLayer {s} ({s}) : {d}", .{ layer.layerName, layer.description, layer.specVersion });
-        }
-
-        const enabled_layers = [_][*:0]const u8{"VK_LAYER_KHRONOS_validation"};
-        const enabled_extensions = [_][*:0]const u8{
-            "VK_KHR_surface",
-            if (builtin.os.tag == .windows) "VK_KHR_win32_surface" else "whatever",
-            "VK_EXT_debug_utils",
-        };
-
-        const dbg_utils_create_info = gfx.VkDebugUtilsMessengerCreateInfoEXT{
-            .sType = gfx.VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
+    const queue_create_info = [_]gfx.VkDeviceQueueCreateInfo{
+        gfx.VkDeviceQueueCreateInfo{
+            .sType = gfx.VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
             .pNext = null,
             .flags = 0,
+            .queueFamilyIndex = ds.queue_family,
+            .queueCount = @intCast(queue_priorities.len),
+            .pQueuePriorities = &queue_priorities,
+        },
+    };
+
+    const device_exts = [_][*:0]const u8{
+        gfx.VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+        gfx.VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME,
+        gfx.VK_KHR_MAINTENANCE1_EXTENSION_NAME,
+    };
+
+    var f2 = ds.pdd.features;
+    var f11 = ds.pdd.features_vk11;
+    var f12 = ds.pdd.features_vk12;
+    var f13 = ds.pdd.features_vk13;
+
+    f2.pNext = &f11;
+    f11.pNext = &f12;
+    f12.pNext = &f13;
+    f13.pNext = null;
+
+    const device_create_info = gfx.VkDeviceCreateInfo{
+        .sType = gfx.VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+        .pNext = &f2,
+        .flags = 0,
+        .queueCreateInfoCount = @intCast(queue_create_info.len),
+        .pQueueCreateInfos = &queue_create_info,
+        .enabledLayerCount = 0,
+        .ppEnabledLayerNames = null,
+        .enabledExtensionCount = @intCast(device_exts.len),
+        .ppEnabledExtensionNames = &device_exts,
+        .pEnabledFeatures = null,
+    };
+
+    var logical_device: gfx.VkDevice = null;
+    const result = gfx.vkCreateDevice(ds.pdd.device, &device_create_info, null, &logical_device);
+    if (result != gfx.VK_SUCCESS or logical_device == null) {
+        std.log.err("Failed to create logical device, error {d}", .{result});
+        return error.VulkanApiError;
+    }
+
+    var queue: gfx.VkQueue = null;
+    gfx.vkGetDeviceQueue(logical_device, ds.queue_family, 0, &queue);
+
+    return LogicalDeviceState{
+        .device = logical_device,
+        .queue = queue,
+        .queue_family = ds.queue_family,
+        .queue_idx = 0,
+    };
+}
+
+const ComponentMappingIdentity = gfx.VkComponentMapping{
+    .r = gfx.VK_COMPONENT_SWIZZLE_IDENTITY,
+    .g = gfx.VK_COMPONENT_SWIZZLE_IDENTITY,
+    .b = gfx.VK_COMPONENT_SWIZZLE_IDENTITY,
+    .a = gfx.VK_COMPONENT_SWIZZLE_IDENTITY,
+};
+
+const UniqueImageWithMemory = struct {
+    image: gfx.VkImage,
+    memory: gfx.VkDeviceMemory,
+
+    pub fn init(
+        device: gfx.VkDevice,
+        image_create_info: *const gfx.VkImageCreateInfo,
+        mem_props: *const gfx.VkPhysicalDeviceMemoryProperties,
+        mem_type: gfx.VkMemoryPropertyFlags,
+    ) !UniqueImageWithMemory {
+        var image_ptr: gfx.VkImage = null;
+        const create_img_res = vulkan_api_call(gfx.vkCreateImage, .{ device, image_create_info, null, &image_ptr });
+        if (create_img_res != gfx.VK_SUCCESS or image_ptr == null) {
+            return error.VulkanApiError;
+        }
+
+        errdefer {
+            gfx.vkDestroyImage(device, image_ptr, null);
+        }
+
+        return UniqueImageWithMemory.init_with_image(device, image_ptr, mem_props, mem_type);
+    }
+
+    pub fn init_with_image(
+        device: gfx.VkDevice,
+        image: gfx.VkImage,
+        mem_props: *const gfx.VkPhysicalDeviceMemoryProperties,
+        memory_type: gfx.VkMemoryPropertyFlags,
+    ) !UniqueImageWithMemory {
+        var memory_req: gfx.VkMemoryRequirements = undefined;
+        vulkan_api_call(gfx.vkGetImageMemoryRequirements, .{ device, image, &memory_req });
+
+        const memory_alloc_info = make_vulkan_struct(
+            gfx.VkMemoryAllocateInfo,
+            .{
+                .allocationSize = memory_req.size,
+                .memoryTypeIndex = find_memory_type(mem_props, memory_type).?,
+            },
+        );
+
+        var image_memory: gfx.VkDeviceMemory = null;
+        const alloc_result = vulkan_api_call(gfx.vkAllocateMemory, .{ device, &memory_alloc_info, null, &image_memory });
+        if (alloc_result != gfx.VK_SUCCESS) {
+            return error.VulkanApiError;
+        }
+
+        errdefer {
+            gfx.vkFreeMemory(device, image_memory, null);
+        }
+
+        const bind_result = vulkan_api_call(gfx.vkBindImageMemory, .{ device, image, image_memory, 0 });
+        if (bind_result != gfx.VK_SUCCESS)
+            return error.VulkanApiError;
+
+        return UniqueImageWithMemory{ .image = image, .memory = image_memory };
+    }
+
+    pub fn deinit(self: *const UniqueImageWithMemory, device: gfx.VkDevice) void {
+        vulkan_api_call(gfx.vkFreeMemory, .{ device, self.memory, null });
+        vulkan_api_call(gfx.vkDestroyImage, .{ device, self.image, null });
+    }
+};
+
+const UniqueImageWithView = struct {
+    image: UniqueImageWithMemory,
+    view: gfx.VkImageView,
+
+    pub fn init(
+        image: UniqueImageWithMemory,
+        device: gfx.VkDevice,
+        image_view_create_info: *const gfx.VkImageViewCreateInfo,
+    ) !UniqueImageWithView {
+        var image_view: gfx.VkImageView = null;
+        const image_view_create_result = vulkan_api_call(gfx.vkCreateImageView, .{ device, image_view_create_info, null, &image_view });
+        if (image_view_create_result != gfx.VK_SUCCESS or image_view == null) {
+            return error.VulkanApiError;
+        }
+
+        return UniqueImageWithView{
+            .image = image,
+            .view = image_view,
+        };
+    }
+
+    pub fn deinit(self: *const @This(), device: gfx.VkDevice) void {
+        gfx.vkDestroyImageView(device, self.view, null);
+        self.image.deinit(device);
+    }
+};
+
+const FrameState = struct {
+    swapchain_image: gfx.VkImage,
+    swapchain_view: gfx.VkImageView,
+    depth_stencil: UniqueImageWithView,
+    fence: gfx.VkFence,
+    semaphore_present: gfx.VkSemaphore,
+    semaphore_render: gfx.VkSemaphore,
+
+    pub fn deinit(self: *const FrameState, device: gfx.VkDevice) void {
+        self.depth_stencil.deinit(device);
+        gfx.vkDestroyImageView(device, self.swapchain_view, null);
+        gfx.vkDestroyFence(device, self.fence, null);
+        gfx.vkDestroySemaphore(device, self.semaphore_present, null);
+        gfx.vkDestroySemaphore(device, self.semaphore_render, null);
+    }
+
+    pub fn init(device: gfx.VkDevice, swapchain_image: gfx.VkImage, dps: *const PhysicalDeviceWithSurfaceData) !FrameState {
+        const swapchain_view = create_swapchain_image_view: {
+            const image_create_info = gfx.VkImageViewCreateInfo{
+                .sType = gfx.VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                .pNext = null,
+                .flags = 0,
+                .image = swapchain_image,
+                .viewType = gfx.VK_IMAGE_VIEW_TYPE_2D,
+                .format = dps.surface_format.format,
+                .components = ComponentMappingIdentity,
+                .subresourceRange = gfx.VkImageSubresourceRange{
+                    .aspectMask = gfx.VK_IMAGE_ASPECT_COLOR_BIT,
+                    .baseMipLevel = 0,
+                    .levelCount = 1,
+                    .baseArrayLayer = 0,
+                    .layerCount = 1,
+                },
+            };
+
+            var image_view: gfx.VkImageView = null;
+            const result = gfx.vkCreateImageView(device, &image_create_info, null, &image_view);
+            if (result != gfx.VK_SUCCESS or image_view == null) {
+                std.log.err("Failed to create image view, error {d}", .{result});
+                return error.VulkanApiError;
+            }
+
+            break :create_swapchain_image_view image_view;
+        };
+        errdefer {
+            gfx.vkDestroyImageView(device, swapchain_view, null);
+        }
+
+        const depth_stencil_state = create_depth_stencil_state: {
+            const image_create_info = make_vulkan_struct(gfx.VkImageCreateInfo, .{
+                .imageType = gfx.VK_IMAGE_TYPE_2D,
+                // TODO: depth stencil format when creating the logical device !!!!
+                .format = gfx.VK_FORMAT_D32_SFLOAT_S8_UINT,
+                .extent = gfx.VkExtent3D{
+                    .width = dps.surface_caps.currentExtent.width,
+                    .height = dps.surface_caps.currentExtent.height,
+                    .depth = 1,
+                },
+                .mipLevels = 1,
+                .arrayLayers = 1,
+                .samples = gfx.VK_SAMPLE_COUNT_1_BIT,
+                .tiling = gfx.VK_IMAGE_TILING_OPTIMAL,
+                .usage = gfx.VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                .sharingMode = gfx.VK_SHARING_MODE_EXCLUSIVE,
+                .queueFamilyIndexCount = 1,
+                .pQueueFamilyIndices = &dps.queue_family,
+                .initialLayout = gfx.VK_IMAGE_LAYOUT_UNDEFINED,
+            });
+
+            const depth_stencil_image = try UniqueImageWithMemory.init(
+                device,
+                &image_create_info,
+                &dps.pdd.memory,
+                gfx.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+            );
+            errdefer {
+                depth_stencil_image.deinit(device);
+            }
+
+            const image_view_create_info = make_vulkan_struct(gfx.VkImageViewCreateInfo, .{
+                .image = depth_stencil_image.image,
+                .viewType = gfx.VK_IMAGE_VIEW_TYPE_2D,
+                .format = gfx.VK_FORMAT_D32_SFLOAT_S8_UINT,
+                .components = ComponentMappingIdentity,
+                .subresourceRange = gfx.VkImageSubresourceRange{
+                    .aspectMask = gfx.VK_IMAGE_ASPECT_DEPTH_BIT | gfx.VK_IMAGE_ASPECT_STENCIL_BIT,
+                    .baseMipLevel = 0,
+                    .levelCount = 1,
+                    .baseArrayLayer = 0,
+                    .layerCount = 1,
+                },
+            });
+
+            break :create_depth_stencil_state try UniqueImageWithView.init(depth_stencil_image, device, &image_view_create_info);
+        };
+        errdefer {
+            depth_stencil_state.deinit(device);
+        }
+
+        const fence = create_fence: {
+            var fence: gfx.VkFence = null;
+            const fence_create_info = make_vulkan_struct(gfx.VkFenceCreateInfo, .{ .flags = gfx.VK_FENCE_CREATE_SIGNALED_BIT });
+
+            const result = gfx.vkCreateFence(device, &fence_create_info, null, &fence);
+            if (result != gfx.VK_SUCCESS) {
+                std.log.err("Failed to create fence, error {d}", .{result});
+                return error.VulkanApiError;
+            }
+
+            break :create_fence fence;
+        };
+
+        errdefer {
+            gfx.vkDestroyFence(device, fence, null);
+        }
+
+        var semaphores = [_]gfx.VkSemaphore{ null, null };
+        for (&semaphores) |*sem| {
+            var s: gfx.VkSemaphore = null;
+            const semaphore_create_info = make_vulkan_struct(gfx.VkSemaphoreCreateInfo, .{});
+            const result = gfx.vkCreateSemaphore(device, &semaphore_create_info, null, &s);
+
+            if (result != gfx.VK_SUCCESS) {
+                std.log.err("Failed to create semaphore, error {d}", .{result});
+                return error.VulkanApiError;
+            }
+
+            sem.* = s;
+        }
+
+        return FrameState{
+            .swapchain_image = swapchain_image,
+            .swapchain_view = swapchain_view,
+            .depth_stencil = depth_stencil_state,
+            .fence = fence,
+            .semaphore_present = semaphores[0],
+            .semaphore_render = semaphores[1],
+        };
+    }
+};
+
+const SwapchainState = struct {
+    handle: gfx.VkSwapchainKHR,
+    image_count: u32,
+    frame_index: u32,
+    frame_states: std.ArrayList(FrameState),
+
+    fn deinit(self: *const SwapchainState, device: gfx.VkDevice) void {
+        for (self.frame_states.items) |fs| {
+            fs.deinit(device);
+        }
+        self.frame_states.deinit();
+        gfx.vkDestroySwapchainKHR(device, self.handle, null);
+    }
+
+    fn init(
+        ldev: *const LogicalDeviceState,
+        prev_swapchain: ?gfx.VkSwapchainKHR,
+        dps: *const PhysicalDeviceWithSurfaceData,
+        allocator: std.mem.Allocator,
+    ) !SwapchainState {
+        const image_count = std.math.clamp(dps.surface_caps.minImageCount + 2, dps.surface_caps.minImageCount, dps.surface_caps.maxImageCount);
+        if (dps.surface_caps.currentExtent.width == 0xffffffff or dps.surface_caps.currentExtent.height == 0xffffffff) {
+            //
+            //
+        }
+
+        const queue_families = [_]u32{dps.queue_family};
+        const swapchain_create_info = gfx.VkSwapchainCreateInfoKHR{
+            .sType = gfx.VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
+            .pNext = null,
+            .flags = 0,
+            .surface = dps.surface,
+            .minImageCount = image_count,
+            .imageFormat = dps.surface_format.format,
+            .imageColorSpace = dps.surface_format.colorSpace,
+            .imageExtent = dps.surface_caps.currentExtent,
+            .imageArrayLayers = 1,
+            .imageUsage = gfx.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+            .imageSharingMode = gfx.VK_SHARING_MODE_EXCLUSIVE,
+            .queueFamilyIndexCount = @intCast(queue_families.len),
+            .pQueueFamilyIndices = &queue_families,
+            .preTransform = gfx.VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
+            .compositeAlpha = gfx.VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+            .presentMode = dps.present_mode,
+            .clipped = gfx.VK_FALSE,
+            .oldSwapchain = prev_swapchain orelse null,
+        };
+
+        const swapchain = create_swapchain: {
+            var swapchain: gfx.VkSwapchainKHR = null;
+            const result = gfx.vkCreateSwapchainKHR(ldev.device, &swapchain_create_info, null, &swapchain);
+            if (result != gfx.VK_SUCCESS) {
+                std.log.err("Failed to create swapchain, error {d}", .{result});
+                return error.VulkanApiError;
+            }
+
+            break :create_swapchain swapchain;
+        };
+
+        errdefer {
+            gfx.vkDestroySwapchainKHR(ldev.device, swapchain, null);
+        }
+
+        const swapchain_images = get_swapchain_images: {
+            var img_count: u32 = 0;
+            const result = vulkan_api_call(gfx.vkGetSwapchainImagesKHR, .{ ldev.device, swapchain, &img_count, null });
+            if (result != gfx.VK_SUCCESS or img_count == 0) {
+                return error.VulkanApiError;
+            }
+
+            var swapchain_images = try std.ArrayList(gfx.VkImage).initCapacity(allocator, img_count);
+            errdefer {
+                swapchain_images.deinit();
+            }
+            try swapchain_images.resize(img_count);
+
+            const fill_result = vulkan_api_call(
+                gfx.vkGetSwapchainImagesKHR,
+                .{ ldev.device, swapchain, &img_count, swapchain_images.items.ptr },
+            );
+            if (fill_result != gfx.VK_SUCCESS) {
+                return error.VulkanApiError;
+            }
+
+            break :get_swapchain_images swapchain_images;
+        };
+
+        defer {
+            swapchain_images.deinit();
+        }
+
+        var frame_state = try std.ArrayList(FrameState).initCapacity(allocator, swapchain_images.items.len);
+        for (swapchain_images.items) |swapchain_image| {
+            try frame_state.append(try FrameState.init(ldev.device, swapchain_image, dps));
+        }
+        errdefer {
+            frame_state.deinit();
+        }
+
+        return SwapchainState{
+            .handle = swapchain,
+            .image_count = @intCast(swapchain_images.items.len),
+            .frame_index = 0,
+            .frame_states = frame_state,
+        };
+    }
+};
+
+const SurfaceKHRState = struct {
+    surface: gfx.VkSurfaceKHR,
+    surface_format: gfx.VkSurfaceFormatKHR,
+    depth_stencil_format: gfx.VkFormat,
+    surface_caps: gfx.VkSurfaceCapabilitiesKHR,
+    present_mode: gfx.VkPresentModeKHR,
+};
+
+const VulkanDynamicDispatch = struct {
+    vkCreateDebugUtilsMessengerEXT: @typeInfo(gfx.PFN_vkCreateDebugUtilsMessengerEXT).Optional.child,
+    vkDestroyDebugUtilsMessengerEXT: @typeInfo(gfx.PFN_vkDestroyDebugUtilsMessengerEXT).Optional.child,
+
+    pub fn init(instance: gfx.VkInstance) !VulkanDynamicDispatch {
+        var dispatch: VulkanDynamicDispatch = undefined;
+
+        inline for (@typeInfo(@This()).Struct.fields) |field| {
+            std.log.info("Field ptr {s}, {s}", .{ field.name, @typeName(field.type) });
+            const func_ptr = gfx.vkGetInstanceProcAddr(instance, field.name);
+            if (func_ptr == null) {
+                std.log.err("Failed to load function pointer {s}", .{field.name});
+                return error.VulkanApiError;
+            }
+            @field(dispatch, field.name) = @ptrCast(func_ptr);
+            std.log.info("Loaded function pointer {s} @ 0x{x:8>0}", .{ field.name, @intFromPtr(@field(dispatch, field.name)) });
+        }
+
+        return dispatch;
+    }
+};
+
+const VulkanDebugState = struct {
+    debug_utils_msgr: gfx.VkDebugUtilsMessengerEXT,
+
+    pub fn init(instance: gfx.VkInstance, dispatch: *const VulkanDynamicDispatch) !VulkanDebugState {
+        const dbg_utils_create_info = make_vulkan_struct(gfx.VkDebugUtilsMessengerCreateInfoEXT, .{
             .messageSeverity = gfx.VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT | gfx.VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT,
             .messageType = gfx.VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | gfx.VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | gfx.VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
             .pfnUserCallback = vk_dbg_utils_msg_callback,
             .pUserData = null,
-        };
+        });
 
-        const app_info = gfx.VkApplicationInfo{
-            .sType = gfx.VK_STRUCTURE_TYPE_APPLICATION_INFO,
-            .pNext = null,
-            .pApplicationName = "doing_ur_mom_with_vulkan_from_zig",
-            .applicationVersion = gfx.VK_MAKE_API_VERSION(1, 0, 0, 0),
-            .pEngineName = "pepega_engine",
-            .engineVersion = gfx.VK_MAKE_API_VERSION(1, 0, 0, 0),
-            .apiVersion = gfx.VK_API_VERSION_1_3,
-        };
+        var debug_utils_msgr: gfx.VkDebugUtilsMessengerEXT = null;
+        const result = vulkan_api_call(dispatch.vkCreateDebugUtilsMessengerEXT, .{ instance, &dbg_utils_create_info, null, &debug_utils_msgr });
+        if (result != gfx.VK_SUCCESS)
+            return error.VulkanApiError;
 
-        const inst_create_info = gfx.VkInstanceCreateInfo{
-            .sType = gfx.VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-            .pNext = &dbg_utils_create_info,
-            .flags = 0,
-            .pApplicationInfo = &app_info,
-            .enabledLayerCount = enabled_layers.len,
-            .ppEnabledLayerNames = &enabled_layers,
-            .enabledExtensionCount = enabled_extensions.len,
-            .ppEnabledExtensionNames = &enabled_extensions,
-        };
-
-        var instance: gfx.VkInstance = null;
-        const result = gfx.vkCreateInstance(&inst_create_info, null, &instance);
-        if (result != gfx.VK_SUCCESS or instance == null) {
-            std.log.info("Failed to create Vulkan instance! error {x}", .{result});
-            return;
-        }
-
-        break :create_vk_instance instance.?;
-    };
-
-    const surface_khr = create_vulkan_surface(vkinstance, window);
-    const phys_dev = try get_physical_device(vkinstance, surface_khr, fba);
-    _ = phys_dev;
-
-    var renderer = try sdl.createRenderer(window, null, .{ .accelerated = true });
-    defer {
-        renderer.destroy();
+        return VulkanDebugState{ .debug_utils_msgr = debug_utils_msgr };
     }
 
-    event_loop: while (true) {
-        if (sdl.pollEvent()) |event| {
-            switch (event) {
-                .key_down => |keydown| {
-                    if (keydown.keycode == sdl.Keycode.escape) {
-                        break :event_loop;
-                    }
-                },
-                else => {},
-            }
-        }
+    fn deinit(
+        self: *const VulkanDebugState,
+        instance: gfx.VkInstance,
+        dispatch: *const VulkanDynamicDispatch,
+    ) void {
+        vulkan_api_call(dispatch.vkDestroyDebugUtilsMessengerEXT, .{ instance, self.debug_utils_msgr, null });
+    }
+};
 
-        try renderer.setColor(sdl.Color.green);
-        try renderer.clear();
-        renderer.present();
+const VulkanRenderer = struct {
+    instance: gfx.VkInstance,
+    dyn_dispatch: VulkanDynamicDispatch,
+    dbg: VulkanDebugState,
+    physical: PhysicalDeviceData,
+    logical: LogicalDeviceState,
+    surface: SurfaceKHRState,
+    swapchain: SwapchainState,
+
+    pub fn init(window: sdl.Window, alloc: AllocatorBundle) !VulkanRenderer {
+        const instance = try create_vulkan_instance(alloc.fixed.allocator());
+        const dyn_dispatch = try VulkanDynamicDispatch.init(instance);
+
+        const debug_state = try VulkanDebugState.init(instance, &dyn_dispatch);
+        const surface_khr = try create_vulkan_surface(instance, window);
+        std.log.info("Create Vulkan surface (VkSurfaceKHR @ 0x{x:8>})", .{@intFromPtr(surface_khr)});
+
+        const phys_dev = try get_physical_device(instance, surface_khr, alloc.fixed.allocator());
+        const device = try create_logical_device(&phys_dev);
+
+        std.log.info(
+            "Created logical device @ 0x{x:8>}, queue @ 0x{x:8>}",
+            .{ @intFromPtr(device.device), @intFromPtr(device.queue) },
+        );
+
+        const swapchain_state = try SwapchainState.init(&device, null, &phys_dev, alloc.gpa.*);
+
+        return VulkanRenderer{
+            .instance = instance,
+            .dyn_dispatch = dyn_dispatch,
+            .dbg = debug_state,
+            .physical = phys_dev.pdd,
+            .logical = device,
+            .surface = SurfaceKHRState{
+                .surface = surface_khr,
+                .surface_format = phys_dev.surface_format,
+                .depth_stencil_format = gfx.VK_FORMAT_D32_SFLOAT_S8_UINT,
+                .surface_caps = phys_dev.surface_caps,
+                .present_mode = phys_dev.present_mode,
+            },
+            .swapchain = swapchain_state,
+        };
+    }
+
+    pub fn deinit(self: *const VulkanRenderer) void {
+        _ = gfx.vkQueueWaitIdle(self.logical.queue);
+        self.swapchain.deinit(self.logical.device);
+        gfx.vkDestroySurfaceKHR(self.instance, self.surface.surface, null);
+        self.logical.deinit();
+        self.dbg.deinit(self.instance, &self.dyn_dispatch);
+        gfx.vkDestroyInstance(self.instance, null);
+    }
+};
+
+fn vulkan_api_call(vkfunc: anytype, func_args: anytype) switch (@typeInfo(@TypeOf(vkfunc))) {
+    .Pointer => |fnptr| @typeInfo(fnptr.child).Fn.return_type.?,
+    .Fn => |func| func.return_type.?,
+
+    else => {
+        @compileError("Unsupported");
+    },
+} {
+    const arg_pack_type = @typeInfo(@TypeOf(func_args));
+    if (arg_pack_type != .Struct) {
+        @compileError("expected tuple or struct argument, found " ++ @typeName(@TypeOf(func_args)));
+    }
+
+    const return_type = switch (@typeInfo(@TypeOf(vkfunc))) {
+        .Pointer => |fnptr| @typeInfo(fnptr.child).Fn.return_type.?,
+        .Fn => |func| func.return_type.?,
+        else => {
+            @compileError("Unsupported");
+        },
+    };
+    const func_params = switch (@typeInfo(@TypeOf(vkfunc))) {
+        .Pointer => |fnptr| @typeInfo(fnptr.child).Fn.params,
+        .Fn => |func| func.params,
+        else => {
+            @compileError("Unsupported");
+        },
+    };
+
+    if (arg_pack_type.Struct.fields.len != func_params.len)
+        @compileError("Wrong number of arguments to call of " ++ @typeName(@TypeOf(vkfunc)));
+
+    switch (@typeInfo(return_type)) {
+        .Void => {
+            @call(std.builtin.CallModifier.auto, vkfunc, func_args);
+        },
+        .Int => {
+            const return_value = @call(std.builtin.CallModifier.auto, vkfunc, func_args);
+            if (return_value != gfx.VK_SUCCESS) {
+                std.log.err("Vulkan API error: {d} - 0x{x:8>0}", .{ return_value, return_value });
+            }
+            return return_value;
+        },
+        else => {
+            @compileError("This function's return type is not supported yet!");
+        },
     }
 }
 
-const atomic_package_counter_t = std.atomic.Value(u32);
+fn make_vulkan_struct(comptime T: type, args: anytype) T {
+    const type_hash = comptime std.hash.Fnv1a_64.hash(@typeName(T));
+    var result: T = undefined;
 
-fn create_vulkan_surface(vkinst: gfx.VkInstance, window: sdl.Window) gfx.VkSurfaceKHR {
-    switch (builtin.os.tag) {
-        .windows => {
-            const wmi = window.getWMInfo() catch {
-                @panic("Failed to get window data!");
-            };
+    if (!@hasField(T, "sType"))
+        @compileError("Type " ++ @typeName(T) ++ " is missing a required field (sType). Is this a Vulkan API structure ?!");
 
-            std.log.info(
-                "HINSTANCE 0x{x:0>8}, WIN 0x{x:0>8}",
-                .{ @intFromPtr(wmi.u.win.hinstance), @intFromPtr(wmi.u.win.window) },
-            );
+    if (@hasField(T, "pNext"))
+        @field(result, "pNext") = null;
 
-            const surface_create_info = gfx.VkWin32SurfaceCreateInfoKHR{
-                .sType = gfx.VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR,
-                .pNext = null,
-                .flags = 0,
-                .hinstance = @alignCast(@ptrCast(wmi.u.win.hinstance)),
-                .hwnd = @alignCast(@ptrCast(wmi.u.win.window)),
-            };
+    if (@hasField(T, "flags"))
+        @field(result, "flags") = 0;
 
-            var surface: gfx.VkSurfaceKHR = null;
-            const result = gfx.vkCreateWin32SurfaceKHR(vkinst, &surface_create_info, null, &surface);
-            if (result != gfx.VK_SUCCESS) {
-                std.log.err("Failed to create surface, error {d}", .{result});
-                @panic("Fatal error");
-            }
-
-            std.log.info("Created VkSurfaceKHR {any}", .{surface});
-            return surface;
+    switch (type_hash) {
+        std.hash.Fnv1a_64.hash(@typeName(gfx.VkImageCreateInfo)) => {
+            result.sType = gfx.VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
         },
-        else => @panic("Not implemented for this platform!"),
+        std.hash.Fnv1a_64.hash(@typeName(gfx.VkImageViewCreateInfo)) => {
+            result.sType = gfx.VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        },
+        std.hash.Fnv1a_64.hash(@typeName(gfx.VkSemaphoreCreateInfo)) => {
+            result.sType = gfx.VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+        },
+        std.hash.Fnv1a_64.hash(@typeName(gfx.VkFenceCreateInfo)) => {
+            result.sType = gfx.VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        },
+        std.hash.Fnv1a_64.hash(@typeName(gfx.VkMemoryAllocateInfo)) => {
+            result.sType = gfx.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        },
+        std.hash.Fnv1a_64.hash(@typeName(gfx.VkDebugUtilsMessengerCreateInfoEXT)) => {
+            result.sType = gfx.VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
+        },
+        else => @compileError("Type " ++ @typeName(T) ++ " not supported!"),
     }
+
+    inline for (@typeInfo(@TypeOf(args)).Struct.fields) |args_field| {
+        if (!@hasField(T, args_field.name))
+            @compileError("Type " ++ @typeName(T) ++ " does not have field " ++ args_field.name);
+
+        @field(result, args_field.name) = @field(args, args_field.name);
+    }
+
+    return result;
+}
+
+fn find_memory_type(mem_props: *const gfx.VkPhysicalDeviceMemoryProperties, req_props: gfx.VkMemoryPropertyFlags) ?u32 {
+    var memory_index: u32 = 0;
+    while (memory_index < mem_props.memoryTypeCount) : (memory_index += 1) {
+        const properties = mem_props.memoryTypes[memory_index].propertyFlags;
+
+        if ((properties & req_props) != 0) {
+            return memory_index;
+        }
+    }
+
+    return null;
 }

@@ -23,17 +23,19 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
-        .zigwin32 = .{
-            .url = "https://github.com/marlersoft/zigwin32/archive/main.tar.gz",
-            .hash = "12200c87006a41a3d51b8bf892ebe7aeb13444bf22add39640d1061df01d2caeb7ed",
-        },
+        // .zigwin32 = .{
+        //     .url = "https://github.com/marlersoft/zigwin32/archive/main.tar.gz",
+        //     .hash = "12200c87006a41a3d51b8bf892ebe7aeb13444bf22add39640d1061df01d2caeb7ed",
+        // },
         .sdl = .{
-            .url = "https://github.com/ikskuh/SDL.zig/archive/refs/heads/master.zip",
-            .hash = "1220b2b2fd5a019a896295f498720475e5fd85bd260110bc1f6f818c2eb7aaa1c6a9",
+            // .url = "https://github.com/ikskuh/SDL.zig/archive/refs/heads/master.zip",
+		.url = "https://github.com/adihodos/SDL.zig/archive/a51701f3bb4a822430e0c206cef8d842955f910f.tar.gz",
+		.hash = "122094af984dbb6d760c8506ba33f85c80e5a855cc27641a17ee6ed9495f27a754ba",
+            //.hash = "122051e6ccd8643eb6b0ea5f3176a3a98f41badaf499feb1ba31b3bba4e1cd339f6a",
         },
         .vulkan_zig = .{
             .url = "https://github.com/Snektron/vulkan-zig/archive/ff4cff5f64d5769e782ef5eadfa91bc713e4bbf1.tar.gz",
-            .hash = "12200c25e9eb199dee1079bd602fa2fd1f7b727d8cd4f47028744f10b1ca3ce8e356",
+            .hash = "122051e6ccd8643eb6b0ea5f3176a3a98f41badaf499feb1ba31b3bba4e1cd339f6a",
         },
         .vulkan_headers = .{
             .url = "https://github.com/KhronosGroup/Vulkan-Headers/archive/v1.3.283.tar.gz",

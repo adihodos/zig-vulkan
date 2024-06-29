@@ -1,5 +1,6 @@
 const std = @import("std");
 const sdl = @import("sdl");
+const builtin = @import("builtin");
 
 // Although this function looks imperative, note that its job is to
 // declaratively construct a build graph that will be executed by an external
@@ -60,8 +61,10 @@ pub fn build(b: *std.Build) void {
     sdl_sdk.link(exe, .static);
     exe.root_module.addImport("sdl2", sdl_sdk.getWrapperModule());
 
-    const zigwin32 = b.dependency("zigwin32", .{});
-    exe.root_module.addImport("zigwin32", zigwin32.module("zigwin32"));
+    if (builtin.os.tag == .windows) {
+        const zigwin32 = b.dependency("zigwin32", .{});
+        exe.root_module.addImport("zigwin32", zigwin32.module("zigwin32"));
+    }
 
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
