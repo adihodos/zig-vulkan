@@ -329,23 +329,21 @@ fn vk_dbg_utils_msg_callback(
 }
 
 const AllocatorBundle = struct {
-    gpa: *std.mem.Allocator,
+    gpa: *std.heap.GeneralPurposeAllocator,
     fixed: *std.heap.FixedBufferAllocator,
 };
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    var allocator = gpa.allocator();
+    var general_alloc = std.heap.GeneralPurposeAllocator(.{}){};
     defer {
-        _ = gpa.deinit();
+        _ = general_alloc.deinit();
     }
 
-    var fba_alloc = std.heap.FixedBufferAllocator.init(&g_scratch_buffer);
-    //var fba = fba_alloc.allocator();
+    var fixed_allocator = std.heap.FixedBufferAllocator.init(&g_scratch_buffer);
 
     const alloc_bundle = AllocatorBundle{
-        .gpa = &allocator,
-        .fixed = &fba_alloc,
+        .gpa = &general_alloc,
+        .fixed = &fixed_allocator,
     };
 
     try sdl.init(.{
@@ -370,26 +368,6 @@ pub fn main() !void {
     defer {
         vulkan_renderer.deinit();
     }
-
-    // const vkinstance = try create_vulkan_instance(fba);
-    // const surface_khr = try create_vulkan_surface(vkinstance, window);
-    // std.log.info("Create Vulkan surface (VkSurfaceKHR @ 0x{x:8>})", .{@intFromPtr(surface_khr)});
-    //
-    // const phys_dev = try get_physical_device(vkinstance, surface_khr, fba);
-    // const device = try create_logical_device(&phys_dev);
-    // defer {
-    //     device.deinit();
-    // }
-    //
-    // std.log.info(
-    //     "Created logical device @ 0x{x:8>}, queue @ 0x{x:8>}",
-    //     .{ @intFromPtr(device.device), @intFromPtr(device.queue) },
-    // );
-    //
-    // const swapchain_data = try SwapchainState.init(&device, null, &phys_dev, allocator);
-    // errdefer {
-    //     swapchain_data.deinit(device.device);
-    // }
 
     var renderer = try sdl.createRenderer(window, null, .{ .accelerated = true });
     defer {
@@ -562,7 +540,7 @@ const GraphicsSystemError = error{
     VulkanApiError,
 };
 
-const PhysicalDeviceData = struct {
+const PhysicalDeviceState = struct {
     device: gfx.VkPhysicalDevice,
     props: gfx.VkPhysicalDeviceProperties2,
     props_vk11: gfx.VkPhysicalDeviceVulkan11Properties,
@@ -574,8 +552,8 @@ const PhysicalDeviceData = struct {
     features_vk13: gfx.VkPhysicalDeviceVulkan13Features,
     memory: gfx.VkPhysicalDeviceMemoryProperties,
 
-    pub fn create(device: gfx.VkPhysicalDevice) PhysicalDeviceData {
-        var pdd: PhysicalDeviceData = PhysicalDeviceData{
+    pub fn create(device: gfx.VkPhysicalDevice) PhysicalDeviceState {
+        var pdd: PhysicalDeviceState = PhysicalDeviceState{
             .device = device,
             .props = gfx.VkPhysicalDeviceProperties2{
                 .sType = gfx.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
@@ -626,7 +604,7 @@ const PhysicalDeviceData = struct {
         return pdd;
     }
 
-    pub fn check_feature_support(self: *const PhysicalDeviceData) bool {
+    pub fn check_feature_support(self: *const PhysicalDeviceState) bool {
         return self.features_vk11.shaderDrawParameters != 0 and
             self.features_vk12.descriptorIndexing != 0 and
             self.features_vk12.descriptorBindingPartiallyBound != 0;
@@ -634,7 +612,7 @@ const PhysicalDeviceData = struct {
 };
 
 const PhysicalDeviceWithSurfaceData = struct {
-    pdd: PhysicalDeviceData,
+    pdd: PhysicalDeviceState,
     surface: gfx.VkSurfaceKHR,
     surface_format: gfx.VkSurfaceFormatKHR,
     surface_caps: gfx.VkSurfaceCapabilitiesKHR,
@@ -664,7 +642,7 @@ fn get_physical_device(vkinst: gfx.VkInstance, surface: gfx.VkSurfaceKHR, alloca
     }
 
     const pdd = find_best_physical_device: for (phys_devices.items) |pd| {
-        const pdd = PhysicalDeviceData.create(pd);
+        const pdd = PhysicalDeviceState.create(pd);
         std.log.info("Phys device {s}, device type {d}", .{ pdd.props.properties.deviceName, pdd.props.properties.deviceType });
 
         if (pdd.props.properties.deviceType != gfx.VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU and
@@ -1319,7 +1297,7 @@ const VulkanRenderer = struct {
     instance: gfx.VkInstance,
     dyn_dispatch: VulkanDynamicDispatch,
     dbg: VulkanDebugState,
-    physical: PhysicalDeviceData,
+    physical: PhysicalDeviceState,
     logical: LogicalDeviceState,
     surface: SurfaceKHRState,
     swapchain: SwapchainState,
