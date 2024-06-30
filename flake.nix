@@ -48,6 +48,7 @@
             inputs.zls.packages.${pkgs.system}.zls
 
             gdb
+            lldb
             seer
             gf
             renderdoc
@@ -71,6 +72,8 @@
             SDL2_gfx
             bashInteractive
 
+            vscode-extensions.vadimcn.vscode-lldb
+
             # libs
             zlib
             xorg.libX11
@@ -83,14 +86,16 @@
             xorg.libXrender
             xorg.libXxf86vm
           ];
+
+          shellHook = with pkgs; ''
+            echo "Starting Zig development env ..."
+              export LD_LIBRARY_PATH="";
+              export PATH="$PATH:${lib.makeSearchPath "share/vscode/extensions/vadimcn.vscode-lldb/adapter" [vscode-extensions.vadimcn.vscode-lldb]}"
+              export MONKA_GIGA="MONKA_MEGA";
+          '';
         };
 
-        shellHook = ''
-          export LD_LIBRARY_PATH="";
-        '';
-
         # For compatibility with older versions of the `nix` binary
-        devShell = self.devShells.${system}.default;
       }
     );
 }

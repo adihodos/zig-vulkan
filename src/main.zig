@@ -367,16 +367,6 @@ pub fn main() !void {
         vulkan_renderer.deinit();
     }
 
-    // var renderer = try sdl.createRenderer(window, null, .{ .accelerated = true });
-    // defer {
-    //     renderer.destroy();
-    // }
-
-    //const wmi = window.getWMInfo() catch {
-    //    @panic("Failed to get window data!");
-    //};
-    //std.log.info("X11 display 0x{x:8>}, window {d}", .{ @intFromPtr(wmi.u.x11.display), wmi.u.x11.window });
-
     event_loop: while (true) {
         if (sdl.pollEvent()) |event| {
             switch (event) {
@@ -1580,7 +1570,7 @@ const VulkanRenderer = struct {
                 .srcStageMask = gfx.VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT,
                 .srcAccessMask = gfx.VK_ACCESS_2_NONE,
                 .dstStageMask = gfx.VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-                .dstAccessMask = gfx.VK_ACCESS_2_SHADER_WRITE_BIT,
+                .dstAccessMask = gfx.VK_ACCESS_2_MEMORY_WRITE_BIT,
                 .oldLayout = gfx.VK_IMAGE_LAYOUT_UNDEFINED,
                 .newLayout = gfx.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                 .srcQueueFamilyIndex = self.logical.queue_family,
@@ -1598,7 +1588,7 @@ const VulkanRenderer = struct {
                 .srcStageMask = gfx.VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT,
                 .srcAccessMask = gfx.VK_ACCESS_2_NONE,
                 .dstStageMask = gfx.VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT,
-                .dstAccessMask = gfx.VK_ACCESS_2_SHADER_WRITE_BIT,
+                .dstAccessMask = gfx.VK_ACCESS_2_MEMORY_WRITE_BIT,
                 .oldLayout = gfx.VK_IMAGE_LAYOUT_UNDEFINED,
                 .newLayout = gfx.VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
                 .srcQueueFamilyIndex = self.logical.queue_family,
@@ -1659,14 +1649,16 @@ const VulkanRenderer = struct {
     }
 
     pub fn end_rendering(self: *VulkanRenderer, render_token: *const FrameRenderState) void {
+        vulkan_api_call(gfx.vkCmdEndRendering, .{render_token.cmd_buf});
+
         //
         // transition color attachments to present layout
         const image_mem_barriers = [_]gfx.VkImageMemoryBarrier2{
             make_vulkan_struct(gfx.VkImageMemoryBarrier2, .{
-                .srcStageMask = gfx.VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                .srcStageMask = gfx.VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
                 .srcAccessMask = gfx.VK_ACCESS_2_MEMORY_WRITE_BIT,
                 .dstStageMask = gfx.VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
-                .dstAccessMask = gfx.VK_ACCESS_2_SHADER_READ_BIT,
+                .dstAccessMask = gfx.VK_ACCESS_2_MEMORY_READ_BIT,
                 .oldLayout = gfx.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                 .newLayout = gfx.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                 .srcQueueFamilyIndex = self.logical.queue_family,
@@ -1689,7 +1681,6 @@ const VulkanRenderer = struct {
 
         vulkan_api_call(gfx.vkCmdPipelineBarrier2, .{ render_token.cmd_buf, &dependency_info });
         _ = vulkan_api_call(gfx.vkEndCommandBuffer, .{self.cmd_state.buffers.items[self.swapchain.frame_index]});
-        vulkan_api_call(gfx.vkCmdEndRendering, .{render_token.cmd_buf});
 
         const frame_state = self.current_frame_state();
         const wait_stages: u32 = @intCast(gfx.VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT);
@@ -1820,11 +1811,8 @@ fn make_vulkan_struct(comptime T: type, args: anytype) T {
     if (!@hasField(T, "sType"))
         @compileError("Type " ++ @typeName(T) ++ " is missing a required field (sType). Is this a Vulkan API structure ?!");
 
-    if (@hasField(T, "pNext"))
-        @field(result, "pNext") = null;
-
-    if (@hasField(T, "flags"))
-        @field(result, "flags") = 0;
+    const bytes = std.mem.asBytes(&result);
+    @memset(bytes, 0);
 
     switch (type_hash) {
         std.hash.Fnv1a_64.hash(@typeName(gfx.VkImageCreateInfo)) => {
@@ -1876,16 +1864,7 @@ fn make_vulkan_struct(comptime T: type, args: anytype) T {
     }
 
     inline for (@typeInfo(@TypeOf(args)).Struct.fields) |args_field| {
-        if (!@hasField(T, args_field.name)) {
-            const init_val = switch (@typeInfo(args_field.type)) {
-                .Int => 0,
-                .Pointer => null,
-                else => @compileError("Add support for fields of type " ++ @typeName(args_field.type)),
-            };
-            @field(result, args_field.name) = init_val;
-        } else {
-            @field(result, args_field.name) = @field(args, args_field.name);
-        }
+        @field(result, args_field.name) = @field(args, args_field.name);
     }
 
     return result;
