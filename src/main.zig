@@ -359,7 +359,8 @@ pub fn main() !void {
         .{ .centered = {} },
         1600,
         1200,
-        .{ .borderless = true, .resizable = false },
+        //.{ .borderless = true, .resizable = false },
+        .{},
     );
 
     var vulkan_renderer = try VulkanRenderer.init(window, alloc_bundle);
@@ -1231,6 +1232,7 @@ const SwapchainState = struct {
         if (surface.surface_caps.currentExtent.width == 0xffffffff or surface.surface_caps.currentExtent.height == 0xffffffff) {
             //
             //
+            @panic("Handle this case!");
         }
 
         const queue_families = [_]u32{logical.queue_family};
@@ -1542,7 +1544,7 @@ const VulkanRenderer = struct {
                 gfx.VK_SUCCESS => {
                     break :acquire_image_for_rendering render_img_idx;
                 },
-                gfx.VK_SUBOPTIMAL_KHR | gfx.VK_ERROR_OUT_OF_DATE_KHR => {
+                gfx.VK_SUBOPTIMAL_KHR, gfx.VK_ERROR_OUT_OF_DATE_KHR => {
                     //
                     // need to recreate the swapchain and try again ...
                     self.recreate_swapchain();
@@ -1570,7 +1572,7 @@ const VulkanRenderer = struct {
                 .srcStageMask = gfx.VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT,
                 .srcAccessMask = gfx.VK_ACCESS_2_NONE,
                 .dstStageMask = gfx.VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-                .dstAccessMask = gfx.VK_ACCESS_2_MEMORY_WRITE_BIT,
+                .dstAccessMask = gfx.VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
                 .oldLayout = gfx.VK_IMAGE_LAYOUT_UNDEFINED,
                 .newLayout = gfx.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                 .srcQueueFamilyIndex = self.logical.queue_family,
@@ -1588,7 +1590,7 @@ const VulkanRenderer = struct {
                 .srcStageMask = gfx.VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT,
                 .srcAccessMask = gfx.VK_ACCESS_2_NONE,
                 .dstStageMask = gfx.VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT,
-                .dstAccessMask = gfx.VK_ACCESS_2_MEMORY_WRITE_BIT,
+                .dstAccessMask = gfx.VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
                 .oldLayout = gfx.VK_IMAGE_LAYOUT_UNDEFINED,
                 .newLayout = gfx.VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
                 .srcQueueFamilyIndex = self.logical.queue_family,
@@ -1655,8 +1657,8 @@ const VulkanRenderer = struct {
         // transition color attachments to present layout
         const image_mem_barriers = [_]gfx.VkImageMemoryBarrier2{
             make_vulkan_struct(gfx.VkImageMemoryBarrier2, .{
-                .srcStageMask = gfx.VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
-                .srcAccessMask = gfx.VK_ACCESS_2_MEMORY_WRITE_BIT,
+                .srcStageMask = gfx.VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                .srcAccessMask = gfx.VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
                 .dstStageMask = gfx.VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
                 .dstAccessMask = gfx.VK_ACCESS_2_MEMORY_READ_BIT,
                 .oldLayout = gfx.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -1717,7 +1719,7 @@ const VulkanRenderer = struct {
             gfx.VK_SUCCESS => {
                 self.swapchain.frame_index = @mod(self.swapchain.frame_index + 1, self.swapchain.image_count);
             },
-            gfx.VK_ERROR_OUT_OF_DATE_KHR | gfx.VK_SUBOPTIMAL_KHR => {
+            gfx.VK_ERROR_OUT_OF_DATE_KHR, gfx.VK_SUBOPTIMAL_KHR => {
                 self.recreate_swapchain();
             },
             else => {
@@ -1727,6 +1729,7 @@ const VulkanRenderer = struct {
     }
 
     fn recreate_swapchain(self: *VulkanRenderer) void {
+        std.log.info("Recreating swapchain ...", .{});
         _ = vulkan_api_call(gfx.vkDeviceWaitIdle, .{self.logical.device});
         //
         // need to recreate the swapchain and try again ...
@@ -1794,7 +1797,7 @@ fn vulkan_api_call(vkfunc: anytype, func_args: anytype) switch (@typeInfo(@TypeO
         .Int => {
             const return_value = @call(std.builtin.CallModifier.auto, vkfunc, func_args);
             if (return_value != gfx.VK_SUCCESS) {
-                std.log.err("Vulkan API error: {d} - 0x{x:8>0}", .{ return_value, return_value });
+                std.log.err("Vulkan API error: ({d} :: 0x{x:8>0})", .{ return_value, @as(u32, @bitCast(return_value)) });
             }
             return return_value;
         },
@@ -1870,7 +1873,10 @@ fn make_vulkan_struct(comptime T: type, args: anytype) T {
     return result;
 }
 
-fn find_memory_type(mem_props: *const gfx.VkPhysicalDeviceMemoryProperties, req_props: gfx.VkMemoryPropertyFlags) ?u32 {
+fn find_memory_type(
+    mem_props: *const gfx.VkPhysicalDeviceMemoryProperties,
+    req_props: gfx.VkMemoryPropertyFlags,
+) ?u32 {
     var memory_index: u32 = 0;
     while (memory_index < mem_props.memoryTypeCount) : (memory_index += 1) {
         const properties = mem_props.memoryTypes[memory_index].propertyFlags;
