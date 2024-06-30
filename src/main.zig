@@ -304,8 +304,6 @@ const WorkerConfiguration = struct {
     shuffle_packages: bool,
 };
 
-// var g_scratch_buffer: [8192 * 8192]raylib.Color = undefined;
-
 var g_scratch_buffer: [8192 * 8192]u8 = undefined;
 
 fn vk_dbg_utils_msg_callback(
@@ -329,7 +327,7 @@ fn vk_dbg_utils_msg_callback(
 }
 
 const AllocatorBundle = struct {
-    gpa: *std.heap.GeneralPurposeAllocator,
+    gpa: std.mem.Allocator,
     fixed: *std.heap.FixedBufferAllocator,
 };
 
@@ -342,7 +340,7 @@ pub fn main() !void {
     var fixed_allocator = std.heap.FixedBufferAllocator.init(&g_scratch_buffer);
 
     const alloc_bundle = AllocatorBundle{
-        .gpa = &general_alloc,
+        .gpa = general_alloc.allocator(),
         .fixed = &fixed_allocator,
     };
 
@@ -364,20 +362,20 @@ pub fn main() !void {
         .{ .borderless = true, .resizable = false },
     );
 
-    const vulkan_renderer = try VulkanRenderer.init(window, alloc_bundle);
+    var vulkan_renderer = try VulkanRenderer.init(window, alloc_bundle);
     defer {
         vulkan_renderer.deinit();
     }
 
-    var renderer = try sdl.createRenderer(window, null, .{ .accelerated = true });
-    defer {
-        renderer.destroy();
-    }
+    // var renderer = try sdl.createRenderer(window, null, .{ .accelerated = true });
+    // defer {
+    //     renderer.destroy();
+    // }
 
-    const wmi = window.getWMInfo() catch {
-        @panic("Failed to get window data!");
-    };
-    std.log.info("X11 display 0x{x:8>}, window {d}", .{ @intFromPtr(wmi.u.x11.display), wmi.u.x11.window });
+    //const wmi = window.getWMInfo() catch {
+    //    @panic("Failed to get window data!");
+    //};
+    //std.log.info("X11 display 0x{x:8>}, window {d}", .{ @intFromPtr(wmi.u.x11.display), wmi.u.x11.window });
 
     event_loop: while (true) {
         if (sdl.pollEvent()) |event| {
@@ -391,9 +389,36 @@ pub fn main() !void {
             }
         }
 
-        try renderer.setColor(sdl.Color.green);
-        try renderer.clear();
-        renderer.present();
+        const frame_render_token = vulkan_renderer.begin_rendering();
+
+        const clear_attachments = [_]gfx.VkClearAttachment{
+            gfx.VkClearAttachment{
+                .aspectMask = gfx.VK_IMAGE_ASPECT_COLOR_BIT,
+                .colorAttachment = 0,
+                .clearValue = gfx.VkClearValue{ .color = gfx.VkClearColorValue{ .float32 = [_]f32{ 1.0, 0.0, 1.0, 1.0 } } },
+            },
+            gfx.VkClearAttachment{
+                .aspectMask = gfx.VK_IMAGE_ASPECT_DEPTH_BIT | gfx.VK_IMAGE_ASPECT_STENCIL_BIT,
+                .colorAttachment = 0,
+                .clearValue = gfx.VkClearValue{ .depthStencil = gfx.VkClearDepthStencilValue{ .depth = 1.0, .stencil = 0 } },
+            },
+        };
+
+        const clear_rectangles = [_]gfx.VkClearRect{gfx.VkClearRect{
+            .rect = gfx.VkRect2D{ .offset = .{ .x = 0, .y = 0 }, .extent = frame_render_token.extent },
+            .layerCount = 1,
+            .baseArrayLayer = 0,
+        }} ** 2;
+
+        vulkan_api_call(gfx.vkCmdClearAttachments, .{
+            frame_render_token.cmd_buf,
+            @as(u32, clear_attachments.len),
+            &clear_attachments,
+            @as(u32, clear_rectangles.len),
+            &clear_rectangles,
+        });
+
+        vulkan_renderer.end_rendering(&frame_render_token);
     }
 }
 
@@ -615,6 +640,7 @@ const PhysicalDeviceWithSurfaceData = struct {
     pdd: PhysicalDeviceState,
     surface: gfx.VkSurfaceKHR,
     surface_format: gfx.VkSurfaceFormatKHR,
+    depth_stencil_format: gfx.VkFormat,
     surface_caps: gfx.VkSurfaceCapabilitiesKHR,
     present_mode: gfx.VkPresentModeKHR,
     queue_family: u32,
@@ -746,8 +772,27 @@ fn get_physical_device(vkinst: gfx.VkInstance, surface: gfx.VkSurfaceKHR, alloca
         const picked_surface_fmt = pick_best_format: for (surface_formats.items) |khr_fmt| {
             std.log.info("checking device support for format {any}", .{khr_fmt});
             for (required_fmts) |req_fmt| {
-                if (req_fmt == khr_fmt.format)
+                if (req_fmt != khr_fmt.format)
+                    continue;
+
+                var format_properties: gfx.VkImageFormatProperties = undefined;
+                const query_result = vulkan_api_call(gfx.vkGetPhysicalDeviceImageFormatProperties, .{
+                    pdd.device,
+                    req_fmt,
+                    gfx.VK_IMAGE_TYPE_2D,
+                    gfx.VK_IMAGE_TILING_OPTIMAL,
+                    gfx.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+                    0,
+                    &format_properties,
+                });
+
+                if (query_result == gfx.VK_SUCCESS)
                     break :pick_best_format khr_fmt;
+
+                if (query_result == gfx.VK_ERROR_FORMAT_NOT_SUPPORTED) {
+                    std.log.info("Format {d} is not supported as color attachment", .{req_fmt});
+                    continue;
+                }
             }
         } else {
             std.log.err("Rejecting device {s}, none of the required formats are supported", .{pdd.props.properties.deviceName});
@@ -764,6 +809,40 @@ fn get_physical_device(vkinst: gfx.VkInstance, surface: gfx.VkSurfaceKHR, alloca
             }
             break :get_surface_caps surface_caps;
         };
+
+        const preferred_depth_stencil_formats = [_]gfx.VkFormat{
+            gfx.VK_FORMAT_D32_SFLOAT_S8_UINT,
+            gfx.VK_FORMAT_D24_UNORM_S8_UINT,
+        };
+
+        const depth_stencil_format = for (preferred_depth_stencil_formats) |fmt_id| {
+            var format_props: gfx.VkImageFormatProperties = undefined;
+            const query_result = vulkan_api_call(
+                gfx.vkGetPhysicalDeviceImageFormatProperties,
+                .{
+                    pdd.device,
+                    fmt_id,
+                    gfx.VK_IMAGE_TYPE_2D,
+                    gfx.VK_IMAGE_TILING_OPTIMAL,
+                    gfx.VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                    0,
+                    &format_props,
+                },
+            );
+
+            if (query_result == gfx.VK_SUCCESS) {
+                break fmt_id;
+            }
+
+            if (query_result == gfx.VK_ERROR_FORMAT_NOT_SUPPORTED) {
+                continue;
+            }
+        } else {
+            std.log.err("None of the specified depth stencil formats are supported ...", .{});
+            continue;
+        };
+
+        std.log.info("Depth stencil format {d}", .{depth_stencil_format});
 
         const best_present_mode = pick_best_present_mode: {
             var count: u32 = 0;
@@ -805,6 +884,7 @@ fn get_physical_device(vkinst: gfx.VkInstance, surface: gfx.VkSurfaceKHR, alloca
             .pdd = pdd,
             .surface = surface,
             .surface_format = picked_surface_fmt,
+            .depth_stencil_format = depth_stencil_format,
             .surface_caps = surface_caps,
             .present_mode = best_present_mode,
             .queue_family = queue_id,
@@ -1002,7 +1082,12 @@ const FrameState = struct {
         gfx.vkDestroySemaphore(device, self.semaphore_render, null);
     }
 
-    pub fn init(device: gfx.VkDevice, swapchain_image: gfx.VkImage, dps: *const PhysicalDeviceWithSurfaceData) !FrameState {
+    pub fn init(swapchain_image: gfx.VkImage, context: anytype) !FrameState {
+        const logical: *const LogicalDeviceState = @field(context, "logical");
+        const physical: *const PhysicalDeviceState = @field(context, "physical");
+        const surface: *const SurfaceKHRState = @field(context, "surface");
+        const device = logical.device;
+
         const swapchain_view = create_swapchain_image_view: {
             const image_create_info = gfx.VkImageViewCreateInfo{
                 .sType = gfx.VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
@@ -1010,7 +1095,7 @@ const FrameState = struct {
                 .flags = 0,
                 .image = swapchain_image,
                 .viewType = gfx.VK_IMAGE_VIEW_TYPE_2D,
-                .format = dps.surface_format.format,
+                .format = surface.surface_format.format,
                 .components = ComponentMappingIdentity,
                 .subresourceRange = gfx.VkImageSubresourceRange{
                     .aspectMask = gfx.VK_IMAGE_ASPECT_COLOR_BIT,
@@ -1037,11 +1122,10 @@ const FrameState = struct {
         const depth_stencil_state = create_depth_stencil_state: {
             const image_create_info = make_vulkan_struct(gfx.VkImageCreateInfo, .{
                 .imageType = gfx.VK_IMAGE_TYPE_2D,
-                // TODO: depth stencil format when creating the logical device !!!!
-                .format = gfx.VK_FORMAT_D32_SFLOAT_S8_UINT,
+                .format = surface.depth_stencil_format,
                 .extent = gfx.VkExtent3D{
-                    .width = dps.surface_caps.currentExtent.width,
-                    .height = dps.surface_caps.currentExtent.height,
+                    .width = surface.surface_caps.currentExtent.width,
+                    .height = surface.surface_caps.currentExtent.height,
                     .depth = 1,
                 },
                 .mipLevels = 1,
@@ -1051,14 +1135,14 @@ const FrameState = struct {
                 .usage = gfx.VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
                 .sharingMode = gfx.VK_SHARING_MODE_EXCLUSIVE,
                 .queueFamilyIndexCount = 1,
-                .pQueueFamilyIndices = &dps.queue_family,
+                .pQueueFamilyIndices = &logical.queue_family,
                 .initialLayout = gfx.VK_IMAGE_LAYOUT_UNDEFINED,
             });
 
             const depth_stencil_image = try UniqueImageWithMemory.init(
                 device,
                 &image_create_info,
-                &dps.pdd.memory,
+                &physical.memory,
                 gfx.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
             );
             errdefer {
@@ -1068,7 +1152,7 @@ const FrameState = struct {
             const image_view_create_info = make_vulkan_struct(gfx.VkImageViewCreateInfo, .{
                 .image = depth_stencil_image.image,
                 .viewType = gfx.VK_IMAGE_VIEW_TYPE_2D,
-                .format = gfx.VK_FORMAT_D32_SFLOAT_S8_UINT,
+                .format = surface.depth_stencil_format,
                 .components = ComponentMappingIdentity,
                 .subresourceRange = gfx.VkImageSubresourceRange{
                     .aspectMask = gfx.VK_IMAGE_ASPECT_DEPTH_BIT | gfx.VK_IMAGE_ASPECT_STENCIL_BIT,
@@ -1142,27 +1226,33 @@ const SwapchainState = struct {
     }
 
     fn init(
-        ldev: *const LogicalDeviceState,
         prev_swapchain: ?gfx.VkSwapchainKHR,
-        dps: *const PhysicalDeviceWithSurfaceData,
-        allocator: std.mem.Allocator,
+        params: anytype,
     ) !SwapchainState {
-        const image_count = std.math.clamp(dps.surface_caps.minImageCount + 2, dps.surface_caps.minImageCount, dps.surface_caps.maxImageCount);
-        if (dps.surface_caps.currentExtent.width == 0xffffffff or dps.surface_caps.currentExtent.height == 0xffffffff) {
+        const logical: *const LogicalDeviceState = @field(params, "logical");
+        const surface: *const SurfaceKHRState = @field(params, "surface");
+        const allocator: *const AllocatorBundle = @field(params, "allocator");
+
+        const image_count = std.math.clamp(
+            surface.surface_caps.minImageCount + 2,
+            surface.surface_caps.minImageCount,
+            surface.surface_caps.maxImageCount,
+        );
+        if (surface.surface_caps.currentExtent.width == 0xffffffff or surface.surface_caps.currentExtent.height == 0xffffffff) {
             //
             //
         }
 
-        const queue_families = [_]u32{dps.queue_family};
+        const queue_families = [_]u32{logical.queue_family};
         const swapchain_create_info = gfx.VkSwapchainCreateInfoKHR{
             .sType = gfx.VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
             .pNext = null,
             .flags = 0,
-            .surface = dps.surface,
+            .surface = surface.surface,
             .minImageCount = image_count,
-            .imageFormat = dps.surface_format.format,
-            .imageColorSpace = dps.surface_format.colorSpace,
-            .imageExtent = dps.surface_caps.currentExtent,
+            .imageFormat = surface.surface_format.format,
+            .imageColorSpace = surface.surface_format.colorSpace,
+            .imageExtent = surface.surface_caps.currentExtent,
             .imageArrayLayers = 1,
             .imageUsage = gfx.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
             .imageSharingMode = gfx.VK_SHARING_MODE_EXCLUSIVE,
@@ -1170,14 +1260,14 @@ const SwapchainState = struct {
             .pQueueFamilyIndices = &queue_families,
             .preTransform = gfx.VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
             .compositeAlpha = gfx.VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
-            .presentMode = dps.present_mode,
+            .presentMode = surface.present_mode,
             .clipped = gfx.VK_FALSE,
             .oldSwapchain = prev_swapchain orelse null,
         };
 
         const swapchain = create_swapchain: {
             var swapchain: gfx.VkSwapchainKHR = null;
-            const result = gfx.vkCreateSwapchainKHR(ldev.device, &swapchain_create_info, null, &swapchain);
+            const result = gfx.vkCreateSwapchainKHR(logical.device, &swapchain_create_info, null, &swapchain);
             if (result != gfx.VK_SUCCESS) {
                 std.log.err("Failed to create swapchain, error {d}", .{result});
                 return error.VulkanApiError;
@@ -1187,17 +1277,17 @@ const SwapchainState = struct {
         };
 
         errdefer {
-            gfx.vkDestroySwapchainKHR(ldev.device, swapchain, null);
+            gfx.vkDestroySwapchainKHR(logical.device, swapchain, null);
         }
 
         const swapchain_images = get_swapchain_images: {
             var img_count: u32 = 0;
-            const result = vulkan_api_call(gfx.vkGetSwapchainImagesKHR, .{ ldev.device, swapchain, &img_count, null });
+            const result = vulkan_api_call(gfx.vkGetSwapchainImagesKHR, .{ logical.device, swapchain, &img_count, null });
             if (result != gfx.VK_SUCCESS or img_count == 0) {
                 return error.VulkanApiError;
             }
 
-            var swapchain_images = try std.ArrayList(gfx.VkImage).initCapacity(allocator, img_count);
+            var swapchain_images = try std.ArrayList(gfx.VkImage).initCapacity(allocator.fixed.allocator(), img_count);
             errdefer {
                 swapchain_images.deinit();
             }
@@ -1205,7 +1295,7 @@ const SwapchainState = struct {
 
             const fill_result = vulkan_api_call(
                 gfx.vkGetSwapchainImagesKHR,
-                .{ ldev.device, swapchain, &img_count, swapchain_images.items.ptr },
+                .{ logical.device, swapchain, &img_count, swapchain_images.items.ptr },
             );
             if (fill_result != gfx.VK_SUCCESS) {
                 return error.VulkanApiError;
@@ -1218,9 +1308,9 @@ const SwapchainState = struct {
             swapchain_images.deinit();
         }
 
-        var frame_state = try std.ArrayList(FrameState).initCapacity(allocator, swapchain_images.items.len);
+        var frame_state = try std.ArrayList(FrameState).initCapacity(allocator.fixed.allocator(), swapchain_images.items.len);
         for (swapchain_images.items) |swapchain_image| {
-            try frame_state.append(try FrameState.init(ldev.device, swapchain_image, dps));
+            try frame_state.append(try FrameState.init(swapchain_image, params));
         }
         errdefer {
             frame_state.deinit();
@@ -1293,6 +1383,63 @@ const VulkanDebugState = struct {
     }
 };
 
+const CommandState = struct {
+    pool: gfx.VkCommandPool,
+    buffers: std.ArrayList(gfx.VkCommandBuffer),
+
+    pub fn init(device: gfx.VkDevice, queue_family: u32, cmd_buffers_count: u32, alloc: *const AllocatorBundle) !CommandState {
+        const command_pool_create_info = make_vulkan_struct(
+            gfx.VkCommandPoolCreateInfo,
+            .{
+                .flags = gfx.VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | gfx.VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+                .queueFamilyIndex = queue_family,
+            },
+        );
+
+        var cmd_pool_handle: gfx.VkCommandPool = null;
+        const result = vulkan_api_call(gfx.vkCreateCommandPool, .{ device, &command_pool_create_info, null, &cmd_pool_handle });
+        if (result != gfx.VK_SUCCESS)
+            return error.VulkanApiError;
+
+        errdefer {
+            gfx.vkDestroyCommandPool(device, cmd_pool_handle, null);
+        }
+
+        var cmd_buffers = try std.ArrayList(gfx.VkCommandBuffer).initCapacity(alloc.gpa, cmd_buffers_count);
+        try cmd_buffers.resize(cmd_buffers_count);
+
+        const cmd_buf_alloc_info = make_vulkan_struct(
+            gfx.VkCommandBufferAllocateInfo,
+            .{
+                .commandPool = cmd_pool_handle,
+                .level = gfx.VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                .commandBufferCount = cmd_buffers_count,
+            },
+        );
+
+        const alloc_result = vulkan_api_call(
+            gfx.vkAllocateCommandBuffers,
+            .{ device, &cmd_buf_alloc_info, cmd_buffers.items.ptr },
+        );
+        if (alloc_result != gfx.VK_SUCCESS)
+            return error.VulkanApiError;
+
+        return CommandState{ .pool = cmd_pool_handle, .buffers = cmd_buffers };
+    }
+
+    pub fn deinit(self: *const CommandState, device: gfx.VkDevice) void {
+        vulkan_api_call(gfx.vkDestroyCommandPool, .{ device, self.pool, null });
+        self.buffers.deinit();
+    }
+};
+
+const FrameRenderState = struct {
+    cmd_buf: gfx.VkCommandBuffer,
+    frameid: u32,
+    render_image: u32,
+    extent: gfx.VkExtent2D,
+};
+
 const VulkanRenderer = struct {
     instance: gfx.VkInstance,
     dyn_dispatch: VulkanDynamicDispatch,
@@ -1301,6 +1448,8 @@ const VulkanRenderer = struct {
     logical: LogicalDeviceState,
     surface: SurfaceKHRState,
     swapchain: SwapchainState,
+    cmd_state: CommandState,
+    alloc: AllocatorBundle,
 
     pub fn init(window: sdl.Window, alloc: AllocatorBundle) !VulkanRenderer {
         const instance = try create_vulkan_instance(alloc.fixed.allocator());
@@ -1311,6 +1460,13 @@ const VulkanRenderer = struct {
         std.log.info("Create Vulkan surface (VkSurfaceKHR @ 0x{x:8>})", .{@intFromPtr(surface_khr)});
 
         const phys_dev = try get_physical_device(instance, surface_khr, alloc.fixed.allocator());
+        const surface = SurfaceKHRState{
+            .surface = surface_khr,
+            .surface_format = phys_dev.surface_format,
+            .depth_stencil_format = phys_dev.depth_stencil_format,
+            .surface_caps = phys_dev.surface_caps,
+            .present_mode = phys_dev.present_mode,
+        };
         const device = try create_logical_device(&phys_dev);
 
         std.log.info(
@@ -1318,7 +1474,12 @@ const VulkanRenderer = struct {
             .{ @intFromPtr(device.device), @intFromPtr(device.queue) },
         );
 
-        const swapchain_state = try SwapchainState.init(&device, null, &phys_dev, alloc.gpa.*);
+        const swapchain_state = try SwapchainState.init(null, .{
+            .logical = &device,
+            .physical = &phys_dev.pdd,
+            .surface = &surface,
+            .allocator = &alloc,
+        });
 
         return VulkanRenderer{
             .instance = instance,
@@ -1329,30 +1490,287 @@ const VulkanRenderer = struct {
             .surface = SurfaceKHRState{
                 .surface = surface_khr,
                 .surface_format = phys_dev.surface_format,
-                .depth_stencil_format = gfx.VK_FORMAT_D32_SFLOAT_S8_UINT,
+                .depth_stencil_format = phys_dev.depth_stencil_format,
                 .surface_caps = phys_dev.surface_caps,
                 .present_mode = phys_dev.present_mode,
             },
             .swapchain = swapchain_state,
+            .cmd_state = try CommandState.init(device.device, device.queue_family, swapchain_state.image_count, &alloc),
+            .alloc = alloc,
         };
     }
 
     pub fn deinit(self: *const VulkanRenderer) void {
-        _ = gfx.vkQueueWaitIdle(self.logical.queue);
+        _ = vulkan_api_call(gfx.vkDeviceWaitIdle, .{self.logical.device});
+        self.cmd_state.deinit(self.logical.device);
         self.swapchain.deinit(self.logical.device);
-        gfx.vkDestroySurfaceKHR(self.instance, self.surface.surface, null);
+        vulkan_api_call(gfx.vkDestroySurfaceKHR, .{ self.instance, self.surface.surface, null });
         self.logical.deinit();
         self.dbg.deinit(self.instance, &self.dyn_dispatch);
-        gfx.vkDestroyInstance(self.instance, null);
+        vulkan_api_call(gfx.vkDestroyInstance, .{ self.instance, null });
+    }
+
+    fn current_frame_state(self: *const VulkanRenderer) *const FrameState {
+        return &self.swapchain.frame_states.items[self.swapchain.frame_index];
+    }
+
+    pub fn begin_rendering(self: *VulkanRenderer) FrameRenderState {
+        //
+        // wait for previous submits associated with this command buffer to finish
+        const frame_state = self.current_frame_state();
+        const wait_submits_result = vulkan_api_call(gfx.vkWaitForFences, .{
+            self.logical.device,
+            1,
+            &frame_state.fence,
+            gfx.VK_TRUE,
+            std.math.maxInt(u32),
+        });
+
+        if (wait_submits_result != gfx.VK_SUCCESS) {
+            @panic("vkFaitForFences failure!");
+        }
+
+        const reset_fence_result = vulkan_api_call(gfx.vkResetFences, .{ self.logical.device, 1, &frame_state.fence });
+        if (reset_fence_result != gfx.VK_SUCCESS) {
+            @panic("Failed to reset fence to unsignaled!");
+        }
+
+        const render_image_index = acquire_image_for_rendering: while (true) {
+            //
+            // acquire image from swapchain
+            var render_img_idx: u32 = undefined;
+            const acquire_image_result = vulkan_api_call(gfx.vkAcquireNextImageKHR, .{
+                self.logical.device,
+                self.swapchain.handle,
+                std.math.maxInt(u32),
+                frame_state.semaphore_render,
+                null,
+                &render_img_idx,
+            });
+
+            switch (acquire_image_result) {
+                gfx.VK_SUCCESS => {
+                    break :acquire_image_for_rendering render_img_idx;
+                },
+                gfx.VK_SUBOPTIMAL_KHR | gfx.VK_ERROR_OUT_OF_DATE_KHR => {
+                    //
+                    // need to recreate the swapchain and try again ...
+                    self.recreate_swapchain();
+                },
+                else => {
+                    // TODO: maybe come up with a better way of dealing with this error ...
+                    @panic("Acquire image fatal error!");
+                },
+            }
+        };
+
+        const cmd_buf = self.cmd_state.buffers.items[self.swapchain.frame_index];
+        _ = vulkan_api_call(gfx.vkResetCommandBuffer, .{ cmd_buf, 0 });
+
+        const cmd_buf_begin_info = make_vulkan_struct(gfx.VkCommandBufferBeginInfo, .{
+            .flags = gfx.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+            .pInheritanceInfo = null,
+        });
+        _ = vulkan_api_call(gfx.vkBeginCommandBuffer, .{ cmd_buf, &cmd_buf_begin_info });
+
+        //
+        // transition resources into the proper layout
+        const image_mem_barriers = [_]gfx.VkImageMemoryBarrier2{
+            make_vulkan_struct(gfx.VkImageMemoryBarrier2, .{
+                .srcStageMask = gfx.VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT,
+                .srcAccessMask = gfx.VK_ACCESS_2_NONE,
+                .dstStageMask = gfx.VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                .dstAccessMask = gfx.VK_ACCESS_2_SHADER_WRITE_BIT,
+                .oldLayout = gfx.VK_IMAGE_LAYOUT_UNDEFINED,
+                .newLayout = gfx.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .srcQueueFamilyIndex = self.logical.queue_family,
+                .dstQueueFamilyIndex = self.logical.queue_family,
+                .image = self.swapchain.frame_states.items[render_image_index].swapchain_image,
+                .subresourceRange = gfx.VkImageSubresourceRange{
+                    .aspectMask = gfx.VK_IMAGE_ASPECT_COLOR_BIT,
+                    .baseMipLevel = 0,
+                    .levelCount = 1,
+                    .baseArrayLayer = 0,
+                    .layerCount = 1,
+                },
+            }),
+            make_vulkan_struct(gfx.VkImageMemoryBarrier2, .{
+                .srcStageMask = gfx.VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT,
+                .srcAccessMask = gfx.VK_ACCESS_2_NONE,
+                .dstStageMask = gfx.VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT,
+                .dstAccessMask = gfx.VK_ACCESS_2_SHADER_WRITE_BIT,
+                .oldLayout = gfx.VK_IMAGE_LAYOUT_UNDEFINED,
+                .newLayout = gfx.VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                .srcQueueFamilyIndex = self.logical.queue_family,
+                .dstQueueFamilyIndex = self.logical.queue_family,
+                .image = self.swapchain.frame_states.items[render_image_index].depth_stencil.image.image,
+                .subresourceRange = gfx.VkImageSubresourceRange{
+                    .aspectMask = gfx.VK_IMAGE_ASPECT_DEPTH_BIT | gfx.VK_IMAGE_ASPECT_STENCIL_BIT,
+                    .baseMipLevel = 0,
+                    .levelCount = 1,
+                    .baseArrayLayer = 0,
+                    .layerCount = 1,
+                },
+            }),
+        };
+
+        const dependency_info = make_vulkan_struct(gfx.VkDependencyInfo, .{
+            .dependencyFlags = gfx.VK_DEPENDENCY_BY_REGION_BIT,
+            .imageMemoryBarrierCount = @as(u32, @intCast(image_mem_barriers.len)),
+            .pImageMemoryBarriers = &image_mem_barriers,
+        });
+
+        vulkan_api_call(gfx.vkCmdPipelineBarrier2, .{ cmd_buf, &dependency_info });
+
+        const rendering_attachments = [_]gfx.VkRenderingAttachmentInfo{
+            make_vulkan_struct(gfx.VkRenderingAttachmentInfo, .{
+                .imageView = self.swapchain.frame_states.items[render_image_index].swapchain_view,
+                .imageLayout = gfx.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .loadOp = gfx.VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+                .storeOp = gfx.VK_ATTACHMENT_STORE_OP_STORE,
+            }),
+            make_vulkan_struct(gfx.VkRenderingAttachmentInfo, .{
+                .imageView = self.swapchain.frame_states.items[render_image_index].depth_stencil.view,
+                .imageLayout = gfx.VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                .loadOp = gfx.VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+                .storeOp = gfx.VK_ATTACHMENT_STORE_OP_STORE,
+            }),
+        };
+
+        const rendering_info = make_vulkan_struct(gfx.VkRenderingInfo, .{
+            .renderArea = gfx.VkRect2D{
+                .offset = .{ .x = 0, .y = 0 },
+                .extent = self.surface.surface_caps.currentExtent,
+            },
+            .layerCount = 1,
+            .colorAttachmentCount = 1,
+            .pColorAttachments = &rendering_attachments[0],
+            .pDepthAttachment = &rendering_attachments[1],
+            .pStencilAttachment = &rendering_attachments[1],
+        });
+
+        vulkan_api_call(gfx.vkCmdBeginRendering, .{ cmd_buf, &rendering_info });
+        return FrameRenderState{
+            .cmd_buf = cmd_buf,
+            .frameid = self.swapchain.frame_index,
+            .render_image = render_image_index,
+            .extent = self.surface.surface_caps.currentExtent,
+        };
+    }
+
+    pub fn end_rendering(self: *VulkanRenderer, render_token: *const FrameRenderState) void {
+        //
+        // transition color attachments to present layout
+        const image_mem_barriers = [_]gfx.VkImageMemoryBarrier2{
+            make_vulkan_struct(gfx.VkImageMemoryBarrier2, .{
+                .srcStageMask = gfx.VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                .srcAccessMask = gfx.VK_ACCESS_2_MEMORY_WRITE_BIT,
+                .dstStageMask = gfx.VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
+                .dstAccessMask = gfx.VK_ACCESS_2_SHADER_READ_BIT,
+                .oldLayout = gfx.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .newLayout = gfx.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                .srcQueueFamilyIndex = self.logical.queue_family,
+                .dstQueueFamilyIndex = self.logical.queue_family,
+                .image = self.swapchain.frame_states.items[render_token.render_image].swapchain_image,
+                .subresourceRange = gfx.VkImageSubresourceRange{
+                    .aspectMask = gfx.VK_IMAGE_ASPECT_COLOR_BIT,
+                    .baseMipLevel = 0,
+                    .levelCount = 1,
+                    .baseArrayLayer = 0,
+                    .layerCount = 1,
+                },
+            }),
+        };
+        const dependency_info = make_vulkan_struct(gfx.VkDependencyInfo, .{
+            .dependencyFlags = gfx.VK_DEPENDENCY_BY_REGION_BIT,
+            .imageMemoryBarrierCount = @as(u32, @intCast(image_mem_barriers.len)),
+            .pImageMemoryBarriers = &image_mem_barriers,
+        });
+
+        vulkan_api_call(gfx.vkCmdPipelineBarrier2, .{ render_token.cmd_buf, &dependency_info });
+        _ = vulkan_api_call(gfx.vkEndCommandBuffer, .{self.cmd_state.buffers.items[self.swapchain.frame_index]});
+        vulkan_api_call(gfx.vkCmdEndRendering, .{render_token.cmd_buf});
+
+        const frame_state = self.current_frame_state();
+        const wait_stages: u32 = @intCast(gfx.VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT);
+        const submit_info = make_vulkan_struct(gfx.VkSubmitInfo, .{
+            .waitSemaphoreCount = 1,
+            .pWaitSemaphores = &frame_state.semaphore_render,
+            .pWaitDstStageMask = &wait_stages,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &render_token.cmd_buf,
+            .signalSemaphoreCount = 1,
+            .pSignalSemaphores = &frame_state.semaphore_present,
+        });
+
+        const submit_result = vulkan_api_call(
+            gfx.vkQueueSubmit,
+            .{ self.logical.queue, 1, &submit_info, frame_state.fence },
+        );
+
+        if (submit_result != gfx.VK_SUCCESS) {
+            @panic("VkQueueSubmit failure!");
+        }
+
+        const present_info_khr = make_vulkan_struct(gfx.VkPresentInfoKHR, .{
+            .waitSemaphoreCount = 1,
+            .pWaitSemaphores = &frame_state.semaphore_present,
+            .swapchainCount = 1,
+            .pSwapchains = &self.swapchain.handle,
+            .pImageIndices = &render_token.render_image,
+        });
+
+        const queue_present_res = vulkan_api_call(gfx.vkQueuePresentKHR, .{ self.logical.queue, &present_info_khr });
+
+        switch (queue_present_res) {
+            gfx.VK_SUCCESS => {
+                self.swapchain.frame_index = @mod(self.swapchain.frame_index + 1, self.swapchain.image_count);
+            },
+            gfx.VK_ERROR_OUT_OF_DATE_KHR | gfx.VK_SUBOPTIMAL_KHR => {
+                self.recreate_swapchain();
+            },
+            else => {
+                @panic("Unhandled VkQueuePresent error!");
+            },
+        }
+    }
+
+    fn recreate_swapchain(self: *VulkanRenderer) void {
+        _ = vulkan_api_call(gfx.vkDeviceWaitIdle, .{self.logical.device});
+        //
+        // need to recreate the swapchain and try again ...
+        const query_surface_result = vulkan_api_call(gfx.vkGetPhysicalDeviceSurfaceCapabilitiesKHR, .{
+            self.physical.device,
+            self.surface.surface,
+            &self.surface.surface_caps,
+        });
+
+        if (query_surface_result != gfx.VK_SUCCESS) {
+            @panic("Failed to query surface capabilities on suboptimal/out of date !");
+        }
+
+        var swapchain_state = SwapchainState.init(self.swapchain.handle, .{
+            .logical = &self.logical,
+            .surface = &self.surface,
+            .allocator = &self.alloc,
+            .physical = &self.physical,
+        }) catch {
+            @panic("Failed to recreate swapchain!");
+        };
+
+        defer {
+            swapchain_state.deinit(self.logical.device);
+        }
+
+        std.mem.swap(SwapchainState, &self.swapchain, &swapchain_state);
     }
 };
 
 fn vulkan_api_call(vkfunc: anytype, func_args: anytype) switch (@typeInfo(@TypeOf(vkfunc))) {
     .Pointer => |fnptr| @typeInfo(fnptr.child).Fn.return_type.?,
     .Fn => |func| func.return_type.?,
-
     else => {
-        @compileError("Unsupported");
+        @compileError("Expected function/pointer to function");
     },
 } {
     const arg_pack_type = @typeInfo(@TypeOf(func_args));
@@ -1427,14 +1845,47 @@ fn make_vulkan_struct(comptime T: type, args: anytype) T {
         std.hash.Fnv1a_64.hash(@typeName(gfx.VkDebugUtilsMessengerCreateInfoEXT)) => {
             result.sType = gfx.VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
         },
+        std.hash.Fnv1a_64.hash(@typeName(gfx.VkCommandPoolCreateInfo)) => {
+            result.sType = gfx.VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        },
+        std.hash.Fnv1a_64.hash(@typeName(gfx.VkCommandBufferAllocateInfo)) => {
+            result.sType = gfx.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        },
+        std.hash.Fnv1a_64.hash(@typeName(gfx.VkCommandBufferBeginInfo)) => {
+            result.sType = gfx.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        },
+        std.hash.Fnv1a_64.hash(@typeName(gfx.VkImageMemoryBarrier2)) => {
+            result.sType = gfx.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        },
+        std.hash.Fnv1a_64.hash(@typeName(gfx.VkDependencyInfo)) => {
+            result.sType = gfx.VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        },
+        std.hash.Fnv1a_64.hash(@typeName(gfx.VkRenderingAttachmentInfo)) => {
+            result.sType = gfx.VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        },
+        std.hash.Fnv1a_64.hash(@typeName(gfx.VkRenderingInfo)) => {
+            result.sType = gfx.VK_STRUCTURE_TYPE_RENDERING_INFO;
+        },
+        std.hash.Fnv1a_64.hash(@typeName(gfx.VkSubmitInfo)) => {
+            result.sType = gfx.VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        },
+        std.hash.Fnv1a_64.hash(@typeName(gfx.VkPresentInfoKHR)) => {
+            result.sType = gfx.VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+        },
         else => @compileError("Type " ++ @typeName(T) ++ " not supported!"),
     }
 
     inline for (@typeInfo(@TypeOf(args)).Struct.fields) |args_field| {
-        if (!@hasField(T, args_field.name))
-            @compileError("Type " ++ @typeName(T) ++ " does not have field " ++ args_field.name);
-
-        @field(result, args_field.name) = @field(args, args_field.name);
+        if (!@hasField(T, args_field.name)) {
+            const init_val = switch (@typeInfo(args_field.type)) {
+                .Int => 0,
+                .Pointer => null,
+                else => @compileError("Add support for fields of type " ++ @typeName(args_field.type)),
+            };
+            @field(result, args_field.name) = init_val;
+        } else {
+            @field(result, args_field.name) = @field(args, args_field.name);
+        }
     }
 
     return result;
