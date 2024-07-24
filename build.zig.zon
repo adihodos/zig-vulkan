@@ -29,8 +29,8 @@
         // },
         .sdl = .{
             // .url = "https://github.com/ikskuh/SDL.zig/archive/refs/heads/master.zip",
-		.url = "https://github.com/adihodos/SDL.zig/archive/a51701f3bb4a822430e0c206cef8d842955f910f.tar.gz",
-		.hash = "122094af984dbb6d760c8506ba33f85c80e5a855cc27641a17ee6ed9495f27a754ba",
+            .url = "https://github.com/adihodos/SDL.zig/archive/a51701f3bb4a822430e0c206cef8d842955f910f.tar.gz",
+            .hash = "122094af984dbb6d760c8506ba33f85c80e5a855cc27641a17ee6ed9495f27a754ba",
             //.hash = "122051e6ccd8643eb6b0ea5f3176a3a98f41badaf499feb1ba31b3bba4e1cd339f6a",
         },
         .vulkan_zig = .{
@@ -40,6 +40,9 @@
         .vulkan_headers = .{
             .url = "https://github.com/KhronosGroup/Vulkan-Headers/archive/v1.3.283.tar.gz",
             .hash = "1220a7e73d72a0d56bc2a65f9d8999a7c019e42260a0744c408d1cded111bc205e10",
+        },
+        .shaderc_zig = .{
+            .url = "https://github.com/tiawl/shaderc/archive/v2024.1.tar.gz",
         },
         // .mach_glfw = .{
         //     .url = "https://pkg.machengine.org/mach-glfw/8da44b719e345097664ff2e0a7620474eb11db5f.tar.gz",

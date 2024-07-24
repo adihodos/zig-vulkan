@@ -354,7 +354,7 @@ pub fn main() !void {
     }
 
     const window = try sdl.createWindow(
-        "Zig + SDL + Vulkan",
+        "Zig + SDL2 + Vulkan",
         .{ .centered = {} },
         .{ .centered = {} },
         1600,
@@ -373,6 +373,7 @@ pub fn main() !void {
             switch (event) {
                 .key_down => |keydown| {
                     if (keydown.keycode == sdl.Keycode.escape) {
+                        std.log.info("Quitting ...", .{});
                         break :event_loop;
                     }
                 },
@@ -410,6 +411,7 @@ pub fn main() !void {
         });
 
         vulkan_renderer.end_rendering(&frame_render_token);
+        _ = try std.Thread.yield();
     }
 }
 
@@ -857,9 +859,9 @@ fn get_physical_device(vkinst: gfx.VkInstance, surface: gfx.VkSurfaceKHR, alloca
                 gfx.VK_PRESENT_MODE_FIFO_KHR,
             };
 
-            for (modes.items) |present_mode| {
-                std.log.info("presentation mode: {}", .{present_mode});
-                for (preferred_presentation_modes) |preferred_mode| {
+            for (preferred_presentation_modes) |preferred_mode| {
+                std.log.info("Checking support for presentation mode: {}", .{preferred_mode});
+                for (modes.items) |present_mode| {
                     if (preferred_mode == present_mode) {
                         break :pick_best_present_mode present_mode;
                     }

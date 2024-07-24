@@ -72,6 +72,20 @@
             SDL2_gfx
             bashInteractive
 
+            vulkan-tools
+            vulkan-headers
+            vulkan-loader
+            vulkan-tools-lunarg
+            vulkan-validation-layers
+            vulkan-utility-libraries
+            vulkan-caps-viewer
+            shaderc
+            shaderc.bin
+            shaderc.static
+            shaderc.dev
+            shaderc.lib
+            glslang
+
             vscode-extensions.vadimcn.vscode-lldb
 
             # libs
